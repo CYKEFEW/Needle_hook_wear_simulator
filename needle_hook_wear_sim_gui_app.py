@@ -96,33 +96,66 @@ class App(tk.Tk):
         self._add_entry(tab_core, "采样时间 duration (h) 仅生成时间轴", "duration_h")
 
 
-        # 阶段比例（滑块，百分比，总和=100%）
-        ttk.Label(tab_phase, text="阶段时间比例（滑块调节，自动保持总和=100%）").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        # 阶段比例（滑块 + 可输入百分比 + 可锁定一个滑块，总和=100%）
+        ttk.Label(tab_phase, text="阶段时间比例（滑块/输入；自动保持总和=100%）").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
         tab_phase.columnconfigure(1, weight=1)
 
         self._ratio_lock = False
+        # 三段比例（单位：%）
         self.phase_runin_pct = tk.DoubleVar(value=float(self.cfg.phase_runin_ratio) * 100.0)
         self.phase_stable_pct = tk.DoubleVar(value=float(self.cfg.phase_stable_ratio) * 100.0)
         self.phase_severe_pct = tk.DoubleVar(value=float(self.cfg.phase_severe_ratio) * 100.0)
 
+        # 允许锁定一个阶段（锁定后该滑块与输入框禁用）
+        self.locked_phase = tk.StringVar(value="none")  # none/runin/stable/severe
+
+        # 输入框变量（百分比数值，不带%）
         self._lbl_runin = tk.StringVar()
         self._lbl_stable = tk.StringVar()
         self._lbl_severe = tk.StringVar()
         self.phase_sum_label = tk.StringVar()
 
-        ttk.Label(tab_phase, text="磨合阶段").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Scale(tab_phase, from_=1.0, to=98.0, variable=self.phase_runin_pct, command=lambda _v: self._on_ratio_change("runin")).grid(row=1, column=1, sticky="we", pady=4, padx=(0, 8))
-        ttk.Label(tab_phase, textvariable=self._lbl_runin).grid(row=1, column=2, sticky="w")
+        # 锁定选择
+        ttk.Label(tab_phase, text="锁定：").grid(row=1, column=0, sticky="w", pady=4)
+        lock_box = ttk.Frame(tab_phase)
+        lock_box.grid(row=1, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Radiobutton(lock_box, text="不锁定", variable=self.locked_phase, value="none", command=self._on_lock_change).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(lock_box, text="锁定磨合", variable=self.locked_phase, value="runin", command=self._on_lock_change).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(lock_box, text="锁定稳定", variable=self.locked_phase, value="stable", command=self._on_lock_change).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(lock_box, text="锁定加速", variable=self.locked_phase, value="severe", command=self._on_lock_change).pack(side="left", padx=(0, 10))
 
-        ttk.Label(tab_phase, text="稳定磨损阶段").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Scale(tab_phase, from_=1.0, to=98.0, variable=self.phase_stable_pct, command=lambda _v: self._on_ratio_change("stable")).grid(row=2, column=1, sticky="we", pady=4, padx=(0, 8))
-        ttk.Label(tab_phase, textvariable=self._lbl_stable).grid(row=2, column=2, sticky="w")
+        # 三段：滑块 + 输入框
+        ttk.Label(tab_phase, text="磨合阶段").grid(row=2, column=0, sticky="w", pady=4)
+        self._scale_runin = ttk.Scale(tab_phase, from_=0.0, to=100.0, variable=self.phase_runin_pct,
+                                      command=lambda _v: self._on_ratio_change("runin"))
+        self._scale_runin.grid(row=2, column=1, sticky="we", pady=4, padx=(0, 8))
+        self._entry_runin = ttk.Entry(tab_phase, textvariable=self._lbl_runin, width=8)
+        self._entry_runin.grid(row=2, column=2, sticky="w")
+        ttk.Label(tab_phase, text="%").grid(row=2, column=3, sticky="w", padx=(4, 0))
+        self._entry_runin.bind("<Return>", lambda _e: self._on_ratio_entry("runin"))
+        self._entry_runin.bind("<FocusOut>", lambda _e: self._on_ratio_entry("runin"))
 
-        ttk.Label(tab_phase, text="加速磨损阶段").grid(row=3, column=0, sticky="w", pady=4)
-        ttk.Scale(tab_phase, from_=1.0, to=98.0, variable=self.phase_severe_pct, command=lambda _v: self._on_ratio_change("severe")).grid(row=3, column=1, sticky="we", pady=4, padx=(0, 8))
-        ttk.Label(tab_phase, textvariable=self._lbl_severe).grid(row=3, column=2, sticky="w")
+        ttk.Label(tab_phase, text="稳定磨损阶段").grid(row=3, column=0, sticky="w", pady=4)
+        self._scale_stable = ttk.Scale(tab_phase, from_=0.0, to=100.0, variable=self.phase_stable_pct,
+                                       command=lambda _v: self._on_ratio_change("stable"))
+        self._scale_stable.grid(row=3, column=1, sticky="we", pady=4, padx=(0, 8))
+        self._entry_stable = ttk.Entry(tab_phase, textvariable=self._lbl_stable, width=8)
+        self._entry_stable.grid(row=3, column=2, sticky="w")
+        ttk.Label(tab_phase, text="%").grid(row=3, column=3, sticky="w", padx=(4, 0))
+        self._entry_stable.bind("<Return>", lambda _e: self._on_ratio_entry("stable"))
+        self._entry_stable.bind("<FocusOut>", lambda _e: self._on_ratio_entry("stable"))
 
-        ttk.Label(tab_phase, textvariable=self.phase_sum_label).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 10))
+        ttk.Label(tab_phase, text="加速磨损阶段").grid(row=4, column=0, sticky="w", pady=4)
+        self._scale_severe = ttk.Scale(tab_phase, from_=0.0, to=100.0, variable=self.phase_severe_pct,
+                                       command=lambda _v: self._on_ratio_change("severe"))
+        self._scale_severe.grid(row=4, column=1, sticky="we", pady=4, padx=(0, 8))
+        self._entry_severe = ttk.Entry(tab_phase, textvariable=self._lbl_severe, width=8)
+        self._entry_severe.grid(row=4, column=2, sticky="w")
+        ttk.Label(tab_phase, text="%").grid(row=4, column=3, sticky="w", padx=(4, 0))
+        self._entry_severe.bind("<Return>", lambda _e: self._on_ratio_entry("severe"))
+        self._entry_severe.bind("<FocusOut>", lambda _e: self._on_ratio_entry("severe"))
+
+        ttk.Label(tab_phase, textvariable=self.phase_sum_label).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 10))
 
         # μ 范围输入（min/max）
         ttk.Label(tab_phase, text="三阶段摩擦系数范围（min/max；若 min==max 即固定值）").grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
@@ -134,6 +167,7 @@ class App(tk.Tk):
         self._add_entry(tab_phase, "加速段 μ范围：max", "mu_severe_max", row=11)
 
         self._update_ratio_labels()
+        self._on_lock_change()
 
         # 扰动：只允许 rpm 输入主频（删除直接输入主频）
         ttk.Label(tab_dist, text="机械周期扰动主频：f_mech = rpm/60*m（仅此方式输入）").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
@@ -208,57 +242,139 @@ class App(tk.Tk):
         r3 = float(self.phase_severe_pct.get())
         s = max(1e-9, r1 + r2 + r3)
         r1, r2, r3 = (100.0 * r1 / s, 100.0 * r2 / s, 100.0 * r3 / s)
-        self._lbl_runin.set(f"{r1:.1f}%")
-        self._lbl_stable.set(f"{r2:.1f}%")
-        self._lbl_severe.set(f"{r3:.1f}%")
-        self.phase_sum_label.set(f"磨合/稳定/加速：{r1:.1f}% / {r2:.1f}% / {r3:.1f}%（Σ=100%）")
+        # 输入框显示为纯数字（不带%），便于直接输入
+        self._lbl_runin.set(f"{r1:.2f}")
+        self._lbl_stable.set(f"{r2:.2f}")
+        self._lbl_severe.set(f"{r3:.2f}")
+        self.phase_sum_label.set(f"磨合/稳定/加速：{r1:.2f}% / {r2:.2f}% / {r3:.2f}%（Σ=100%）")
 
     def _on_ratio_change(self, changed: str):
-        """保持三段比例和为 100%，尽量保留未改变两段的相对比例"""
+        """保持三段比例和为 100%。支持锁定一个阶段；未锁定时尽量保留另外两段的相对比例。"""
         if getattr(self, "_ratio_lock", False):
             return
         self._ratio_lock = True
         try:
+            lock = getattr(self, "locked_phase", None)
+            lock = lock.get() if lock is not None else "none"
             r1 = float(self.phase_runin_pct.get())
             r2 = float(self.phase_stable_pct.get())
             r3 = float(self.phase_severe_pct.get())
 
-            # 最小 1%
-            r1 = max(1.0, min(98.0, r1))
-            r2 = max(1.0, min(98.0, r2))
-            r3 = max(1.0, min(98.0, r3))
+            def clamp(x, lo=0.0, hi=100.0):
+                try:
+                    x = float(x)
+                except Exception:
+                    x = 0.0
+                return max(lo, min(hi, x))
 
-            if changed == "runin":
-                rem = 100.0 - r1
-                tot = r2 + r3
-                if tot <= 1e-9:
-                    r2 = rem * 0.8
-                    r3 = rem - r2
-                else:
-                    r2 = rem * (r2 / tot)
-                    r3 = rem - r2
-            elif changed == "stable":
-                rem = 100.0 - r2
-                tot = r1 + r3
-                if tot <= 1e-9:
-                    r1 = rem * 0.3
-                    r3 = rem - r1
-                else:
-                    r1 = rem * (r1 / tot)
-                    r3 = rem - r1
-            else:  # severe
-                rem = 100.0 - r3
-                tot = r1 + r2
-                if tot <= 1e-9:
-                    r1 = rem * 0.2
-                    r2 = rem - r1
-                else:
-                    r1 = rem * (r1 / tot)
-                    r2 = rem - r1
+            r1 = clamp(r1)
+            r2 = clamp(r2)
+            r3 = clamp(r3)
 
-            # 再归一化
-            s = max(1e-9, r1 + r2 + r3)
-            r1, r2, r3 = (100.0 * r1 / s, 100.0 * r2 / s, 100.0 * r3 / s)
+            if lock not in ("runin", "stable", "severe"):
+                lock = "none"
+
+            if lock == "none":
+                # 未锁定：保持 changed 不动，另外两段按原比例缩放到剩余值
+                if changed == "runin":
+                    rem = 100.0 - r1
+                    tot = r2 + r3
+                    if tot <= 1e-9:
+                        r2 = rem * 0.5
+                        r3 = rem - r2
+                    else:
+                        r2 = rem * (r2 / tot)
+                        r3 = rem - r2
+                elif changed == "stable":
+                    rem = 100.0 - r2
+                    tot = r1 + r3
+                    if tot <= 1e-9:
+                        r1 = rem * 0.5
+                        r3 = rem - r1
+                    else:
+                        r1 = rem * (r1 / tot)
+                        r3 = rem - r1
+                else:  # severe
+                    rem = 100.0 - r3
+                    tot = r1 + r2
+                    if tot <= 1e-9:
+                        r1 = rem * 0.5
+                        r2 = rem - r1
+                    else:
+                        r1 = rem * (r1 / tot)
+                        r2 = rem - r1
+                # 归一化到 100
+                s = max(1e-9, r1 + r2 + r3)
+                r1, r2, r3 = (100.0 * r1 / s, 100.0 * r2 / s, 100.0 * r3 / s)
+            else:
+                # 锁定：锁定的那段固定，其余两段保持和为剩余值；改变一个，另一个自动补齐
+                if lock == "runin":
+                    L = clamp(r1)
+                    rem = max(0.0, 100.0 - L)
+                    if changed == "stable":
+                        r2 = clamp(r2, 0.0, rem)
+                        r3 = rem - r2
+                    elif changed == "severe":
+                        r3 = clamp(r3, 0.0, rem)
+                        r2 = rem - r3
+                    else:
+                        # 理论上不会发生（锁定的控件会被禁用），这里做保护
+                        # 保留 r2,r3 比例并归一化到 rem
+                        tot = r2 + r3
+                        if tot <= 1e-9:
+                            r2 = rem * 0.5
+                            r3 = rem - r2
+                        else:
+                            r2 = rem * (r2 / tot)
+                            r3 = rem - r2
+                    r1 = L
+                elif lock == "stable":
+                    L = clamp(r2)
+                    rem = max(0.0, 100.0 - L)
+                    if changed == "runin":
+                        r1 = clamp(r1, 0.0, rem)
+                        r3 = rem - r1
+                    elif changed == "severe":
+                        r3 = clamp(r3, 0.0, rem)
+                        r1 = rem - r3
+                    else:
+                        tot = r1 + r3
+                        if tot <= 1e-9:
+                            r1 = rem * 0.5
+                            r3 = rem - r1
+                        else:
+                            r1 = rem * (r1 / tot)
+                            r3 = rem - r1
+                    r2 = L
+                else:  # lock == severe
+                    L = clamp(r3)
+                    rem = max(0.0, 100.0 - L)
+                    if changed == "runin":
+                        r1 = clamp(r1, 0.0, rem)
+                        r2 = rem - r1
+                    elif changed == "stable":
+                        r2 = clamp(r2, 0.0, rem)
+                        r1 = rem - r2
+                    else:
+                        tot = r1 + r2
+                        if tot <= 1e-9:
+                            r1 = rem * 0.5
+                            r2 = rem - r1
+                        else:
+                            r1 = rem * (r1 / tot)
+                            r2 = rem - r1
+                    r3 = L
+
+                # 最后做一次数值保护，避免浮点误差导致 Σ!=100
+                s = r1 + r2 + r3
+                if abs(s - 100.0) > 1e-6:
+                    # 优先把误差丢到未锁定且不是当前 changed 的那一段（如果存在）
+                    if lock != "runin" and changed != "runin":
+                        r1 = max(0.0, 100.0 - r2 - r3)
+                    elif lock != "stable" and changed != "stable":
+                        r2 = max(0.0, 100.0 - r1 - r3)
+                    else:
+                        r3 = max(0.0, 100.0 - r1 - r2)
 
             self.phase_runin_pct.set(r1)
             self.phase_stable_pct.set(r2)
@@ -267,6 +383,54 @@ class App(tk.Tk):
         finally:
             self._ratio_lock = False
 
+    
+    def _on_ratio_entry(self, which: str):
+        """从输入框读取百分比并应用（回车或失焦触发）"""
+        if getattr(self, "_ratio_lock", False):
+            return
+        try:
+            if which == "runin":
+                v = float(self._lbl_runin.get().strip())
+                self.phase_runin_pct.set(v)
+            elif which == "stable":
+                v = float(self._lbl_stable.get().strip())
+                self.phase_stable_pct.set(v)
+            else:
+                v = float(self._lbl_severe.get().strip())
+                self.phase_severe_pct.set(v)
+        except Exception:
+            # 输入非法则回填当前值
+            self._update_ratio_labels()
+            return
+        self._on_ratio_change(which)
+
+    def _on_lock_change(self):
+        """锁定一个阶段：禁用对应滑块与输入框"""
+        lock = self.locked_phase.get() if hasattr(self, "locked_phase") else "none"
+
+        def set_widget_state(w, enabled: bool):
+            if w is None:
+                return
+            try:
+                w.state(["!disabled"] if enabled else ["disabled"])
+            except Exception:
+                try:
+                    w.configure(state=("normal" if enabled else "disabled"))
+                except Exception:
+                    pass
+
+        # 默认都可编辑
+        set_widget_state(getattr(self, "_scale_runin", None), lock != "runin")
+        set_widget_state(getattr(self, "_entry_runin", None), lock != "runin")
+
+        set_widget_state(getattr(self, "_scale_stable", None), lock != "stable")
+        set_widget_state(getattr(self, "_entry_stable", None), lock != "stable")
+
+        set_widget_state(getattr(self, "_scale_severe", None), lock != "severe")
+        set_widget_state(getattr(self, "_entry_severe", None), lock != "severe")
+
+        # 锁定切换后，强制归一化一次（避免 Σ != 100）
+        self._on_ratio_change("runin")
     def _build_run_panel(self, parent):
         box = ttk.LabelFrame(parent, text="导出与输出", padding=10)
         box.pack(fill="x")
