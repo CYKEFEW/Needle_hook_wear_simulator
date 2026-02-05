@@ -75,11 +75,13 @@ class App(tk.Tk):
 
         tab_core = ttk.Frame(nb, padding=10)
         tab_dist = ttk.Frame(nb, padding=10)
+        tab_phase = ttk.Frame(nb, padding=10)
         tab_filter = ttk.Frame(nb, padding=10)
         tab_judge = ttk.Frame(nb, padding=10)
         tab_export = ttk.Frame(nb, padding=10)
         nb.add(tab_core, text="核心输入")
         nb.add(tab_dist, text="扰动参数")
+        nb.add(tab_phase, text="阶段比例/μ范围")
         nb.add(tab_filter, text="滤波参数")
         nb.add(tab_judge, text="基线/阈值/寿命")
         nb.add(tab_export, text="导出/绘图")
@@ -92,6 +94,46 @@ class App(tk.Tk):
         self._add_entry(tab_core, "平均张力设定 T_set (N)", "t_set_N")
         self._add_entry(tab_core, "采样率 fs (Hz) 仅生成时间轴", "fs_Hz")
         self._add_entry(tab_core, "采样时间 duration (h) 仅生成时间轴", "duration_h")
+
+
+        # 阶段比例（滑块，百分比，总和=100%）
+        ttk.Label(tab_phase, text="阶段时间比例（滑块调节，自动保持总和=100%）").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        tab_phase.columnconfigure(1, weight=1)
+
+        self._ratio_lock = False
+        self.phase_runin_pct = tk.DoubleVar(value=float(self.cfg.phase_runin_ratio) * 100.0)
+        self.phase_stable_pct = tk.DoubleVar(value=float(self.cfg.phase_stable_ratio) * 100.0)
+        self.phase_severe_pct = tk.DoubleVar(value=float(self.cfg.phase_severe_ratio) * 100.0)
+
+        self._lbl_runin = tk.StringVar()
+        self._lbl_stable = tk.StringVar()
+        self._lbl_severe = tk.StringVar()
+        self.phase_sum_label = tk.StringVar()
+
+        ttk.Label(tab_phase, text="磨合阶段").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Scale(tab_phase, from_=1.0, to=98.0, variable=self.phase_runin_pct, command=lambda _v: self._on_ratio_change("runin")).grid(row=1, column=1, sticky="we", pady=4, padx=(0, 8))
+        ttk.Label(tab_phase, textvariable=self._lbl_runin).grid(row=1, column=2, sticky="w")
+
+        ttk.Label(tab_phase, text="稳定磨损阶段").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Scale(tab_phase, from_=1.0, to=98.0, variable=self.phase_stable_pct, command=lambda _v: self._on_ratio_change("stable")).grid(row=2, column=1, sticky="we", pady=4, padx=(0, 8))
+        ttk.Label(tab_phase, textvariable=self._lbl_stable).grid(row=2, column=2, sticky="w")
+
+        ttk.Label(tab_phase, text="加速磨损阶段").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Scale(tab_phase, from_=1.0, to=98.0, variable=self.phase_severe_pct, command=lambda _v: self._on_ratio_change("severe")).grid(row=3, column=1, sticky="we", pady=4, padx=(0, 8))
+        ttk.Label(tab_phase, textvariable=self._lbl_severe).grid(row=3, column=2, sticky="w")
+
+        ttk.Label(tab_phase, textvariable=self.phase_sum_label).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 10))
+
+        # μ 范围输入（min/max）
+        ttk.Label(tab_phase, text="三阶段摩擦系数范围（min/max；若 min==max 即固定值）").grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._add_entry(tab_phase, "磨合段 μ范围：min", "mu_runin_min", row=6)
+        self._add_entry(tab_phase, "磨合段 μ范围：max", "mu_runin_max", row=7)
+        self._add_entry(tab_phase, "稳定段 μ范围：min", "mu_stable_min", row=8)
+        self._add_entry(tab_phase, "稳定段 μ范围：max", "mu_stable_max", row=9)
+        self._add_entry(tab_phase, "加速段 μ范围：min", "mu_severe_min", row=10)
+        self._add_entry(tab_phase, "加速段 μ范围：max", "mu_severe_max", row=11)
+
+        self._update_ratio_labels()
 
         # 扰动：只允许 rpm 输入主频（删除直接输入主频）
         ttk.Label(tab_dist, text="机械周期扰动主频：f_mech = rpm/60*m（仅此方式输入）").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
@@ -159,6 +201,72 @@ class App(tk.Tk):
         except Exception:
             self.f_mech_var.set("f_mech=— Hz（输入有误）")
 
+
+    def _update_ratio_labels(self):
+        r1 = float(self.phase_runin_pct.get())
+        r2 = float(self.phase_stable_pct.get())
+        r3 = float(self.phase_severe_pct.get())
+        s = max(1e-9, r1 + r2 + r3)
+        r1, r2, r3 = (100.0 * r1 / s, 100.0 * r2 / s, 100.0 * r3 / s)
+        self._lbl_runin.set(f"{r1:.1f}%")
+        self._lbl_stable.set(f"{r2:.1f}%")
+        self._lbl_severe.set(f"{r3:.1f}%")
+        self.phase_sum_label.set(f"磨合/稳定/加速：{r1:.1f}% / {r2:.1f}% / {r3:.1f}%（Σ=100%）")
+
+    def _on_ratio_change(self, changed: str):
+        """保持三段比例和为 100%，尽量保留未改变两段的相对比例"""
+        if getattr(self, "_ratio_lock", False):
+            return
+        self._ratio_lock = True
+        try:
+            r1 = float(self.phase_runin_pct.get())
+            r2 = float(self.phase_stable_pct.get())
+            r3 = float(self.phase_severe_pct.get())
+
+            # 最小 1%
+            r1 = max(1.0, min(98.0, r1))
+            r2 = max(1.0, min(98.0, r2))
+            r3 = max(1.0, min(98.0, r3))
+
+            if changed == "runin":
+                rem = 100.0 - r1
+                tot = r2 + r3
+                if tot <= 1e-9:
+                    r2 = rem * 0.8
+                    r3 = rem - r2
+                else:
+                    r2 = rem * (r2 / tot)
+                    r3 = rem - r2
+            elif changed == "stable":
+                rem = 100.0 - r2
+                tot = r1 + r3
+                if tot <= 1e-9:
+                    r1 = rem * 0.3
+                    r3 = rem - r1
+                else:
+                    r1 = rem * (r1 / tot)
+                    r3 = rem - r1
+            else:  # severe
+                rem = 100.0 - r3
+                tot = r1 + r2
+                if tot <= 1e-9:
+                    r1 = rem * 0.2
+                    r2 = rem - r1
+                else:
+                    r1 = rem * (r1 / tot)
+                    r2 = rem - r1
+
+            # 再归一化
+            s = max(1e-9, r1 + r2 + r3)
+            r1, r2, r3 = (100.0 * r1 / s, 100.0 * r2 / s, 100.0 * r3 / s)
+
+            self.phase_runin_pct.set(r1)
+            self.phase_stable_pct.set(r2)
+            self.phase_severe_pct.set(r3)
+            self._update_ratio_labels()
+        finally:
+            self._ratio_lock = False
+
     def _build_run_panel(self, parent):
         box = ttk.LabelFrame(parent, text="导出与输出", padding=10)
         box.pack(fill="x")
@@ -218,6 +326,13 @@ class App(tk.Tk):
                     setattr(self.cfg, k, val)
             except Exception:
                 raise ValueError(f"字段 {k} 输入不合法：{s}")
+        # 阶段比例（GUI滑块，单位%）
+        try:
+            self.cfg.phase_runin_ratio = float(self.phase_runin_pct.get()) / 100.0
+            self.cfg.phase_stable_ratio = float(self.phase_stable_pct.get()) / 100.0
+            self.cfg.phase_severe_ratio = float(self.phase_severe_pct.get()) / 100.0
+        except Exception:
+            pass
         self.cfg.validate()
 
     def _make_cache_key(self) -> str:
@@ -225,9 +340,10 @@ class App(tk.Tk):
             ("theta", self.cfg.theta_deg),
             ("tset", self.cfg.t_set_N),
             ("fs", self.cfg.fs_Hz),
-            ("dur_h", self.cfg.duration_s/3600.0),
+            ("dur_h", self.cfg.duration_s / 3600.0),
             ("rpm", self.cfg.rpm),
             ("m", self.cfg.mech_harmonic),
+
             ("noise_o", self.cfg.noise_rms_open),
             ("noise_c", self.cfg.noise_rms_closed),
             ("mechAo", self.cfg.mech_amp_open),
@@ -236,17 +352,32 @@ class App(tk.Tk):
             ("driftAc", self.cfg.drift_amp_closed),
             ("driftf", self.cfg.drift_freq_hz),
             ("sensor", self.cfg.sensor_rms),
+
             ("hws", self.cfg.hampel_win_s),
             ("hns", self.cfg.hampel_nsig),
             ("fc", self.cfg.lowpass_fc_hz),
+
             ("Wss", self.cfg.stable_win_s),
             ("sig", self.cfg.stable_sigma_max),
             ("slope", self.cfg.stable_slope_max),
             ("qmin", self.cfg.stable_valid_min),
             ("delta", self.cfg.fail_delta),
             ("hold", self.cfg.fail_hold_s),
+
             ("stride", self.cfg.export_stride),
             ("pmax", self.cfg.plot_max_points),
+
+            # 阶段比例/μ范围（GUI新增）
+            ("phase_r1", float(getattr(self.cfg, "phase_runin_ratio", 0.0))),
+            ("phase_r2", float(getattr(self.cfg, "phase_stable_ratio", 0.0))),
+            ("phase_r3", float(getattr(self.cfg, "phase_severe_ratio", 0.0))),
+            ("mu_r_min", float(getattr(self.cfg, "mu_runin_min", 0.0))),
+            ("mu_r_max", float(getattr(self.cfg, "mu_runin_max", 0.0))),
+            ("mu_s_min", float(getattr(self.cfg, "mu_stable_min", 0.0))),
+            ("mu_s_max", float(getattr(self.cfg, "mu_stable_max", 0.0))),
+            ("mu_a_min", float(getattr(self.cfg, "mu_severe_min", 0.0))),
+            ("mu_a_max", float(getattr(self.cfg, "mu_severe_max", 0.0))),
+
             ("seed", int(self.seed.get())),
         ]
         return "|".join([f"{k}={v}" for k, v in items])

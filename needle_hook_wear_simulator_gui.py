@@ -199,50 +199,55 @@ def _write_xlsx_multisheet(
     base_pct: float = 0.0,
     span_pct: float = 100.0,
 ) -> None:
-    """写入 xlsx（同一文件多工作表，必要时自动拆分）"""
+    """
+    写入 xlsx（同一文件多工作表，必要时自动拆分）
+
+    设计要点：
+    - 直接使用 xlsxwriter 写入（比 openpyxl / pandas.to_excel 通常更快）
+    - 若行数超过单sheet上限（约 1048576），会自动在同一个 xlsx 中拆分多个工作表
+    """
+    import xlsxwriter
+
     total_rows = sum(len(df) for df in frames.values())
     total_rows = max(1, total_rows)
     written = 0
 
     def _p(msg: str):
-        nonlocal written
         pct = base_pct + span_pct * (written / total_rows)
         _cb(progress_cb, min(99.0, pct), msg)
 
-    wb = Workbook(write_only=True)
+    wb = xlsxwriter.Workbook(xlsx_path, {"constant_memory": True})
     try:
-        if wb.worksheets:
-            wb.remove(wb.worksheets[0])
-    except Exception:
-        pass
+        for name, df in frames.items():
+            n = len(df)
+            if n <= row_limit:
+                parts = [(name, df)]
+            else:
+                num = int(math.ceil(n / row_limit))
+                parts = []
+                for i in range(num):
+                    s = i * row_limit
+                    e = min(n, (i + 1) * row_limit)
+                    parts.append((f"{name}_{i + 1}", df.iloc[s:e]))
 
-    for name, df in frames.items():
-        cols = list(df.columns)
-        n = len(df)
-        if n == 0:
-            ws = wb.create_sheet(title=(name[:31] or "sheet"))
-            ws.append(cols)
-            continue
+            for sheet, part_df in parts:
+                ws = wb.add_worksheet(sheet[:31])  # Excel sheet name limit
+                cols = list(part_df.columns)
 
-        part, start = 1, 0
-        while start < n:
-            end = min(n, start + row_limit)
-            sheet_name = name if (part == 1 and n <= row_limit) else f"{name}_{part}"
-            ws = wb.create_sheet(title=sheet_name[:31])
-            ws.append(cols)
+                # 表头
+                ws.write_row(0, 0, cols)
 
-            chunk = df.iloc[start:end].to_numpy(dtype=object)
-            for i in range(chunk.shape[0]):
-                ws.append(chunk[i].tolist())
+                # 按列写入（通常比逐行逐单元格更快）
+                for c, col in enumerate(cols):
+                    data = part_df[col].tolist()
+                    ws.write_column(1, c, data)
 
-            written += (end - start)
-            _p(f"写入 xlsx：{name}（{end}/{n}）")
-            start = end
-            part += 1
+                written += len(part_df)
+                _p(f"写入 xlsx：{sheet}（{written}/{total_rows} 行）")
+    finally:
+        wb.close()
 
-    wb.save(xlsx_path)
-    _cb(progress_cb, base_pct + span_pct, f"xlsx 写入完成：{os.path.basename(xlsx_path)}")
-
+    _cb(progress_cb, min(99.0, base_pct + span_pct), "xlsx 写入结束")
 
 @dataclass
 class SimConfig:
@@ -250,7 +255,7 @@ class SimConfig:
     theta_deg: float = 20.0
     t_set_N: float = 5.0
     fs_Hz: float = 50.0
-    duration_s: float = 600.0
+    duration_s: float = 3600.0
 
     # 机械扰动：仅由 rpm 换算
     rpm: float = 300.0
@@ -265,7 +270,23 @@ class SimConfig:
     drift_amp_closed: float = 0.15
     drift_freq_hz: float = 0.01
 
-    # 摩擦系数三阶段（真值）
+    # 阶段时间比例（三段之和会在 validate() 中归一化为 1）
+    # - GUI 使用滑块直接调这三个比例
+    # - 兼容字段：runin_ratio / severe_start_ratio 会由这里自动推导
+    phase_runin_ratio: float = 0.12
+    phase_stable_ratio: float = 0.70
+    phase_severe_ratio: float = 0.18
+
+    # 三阶段摩擦系数范围（用于生成 μ(t) 真值；同一 seed 下可重复）
+    # - 若 min==max，则等效为固定值
+    mu_runin_min: float = 0.30
+    mu_runin_max: float = 0.40
+    mu_stable_min: float = 0.22
+    mu_stable_max: float = 0.28
+    mu_severe_min: float = 0.35
+    mu_severe_max: float = 0.60
+
+    # 兼容旧字段（内部会根据“范围”生成使用值，并写入 derived 输出）
     mu_runin_start: float = 0.35
     mu_stable: float = 0.25
     mu_severe_end: float = 0.55
@@ -305,6 +326,49 @@ class SimConfig:
         assert self.mech_harmonic >= 1
         assert self.rpm > 0, "rpm 必须>0（仅使用转速输入机械主频）"
 
+        # 阶段比例归一化
+        r1 = max(0.0, float(self.phase_runin_ratio))
+        r2 = max(0.0, float(self.phase_stable_ratio))
+        r3 = max(0.0, float(self.phase_severe_ratio))
+        s = r1 + r2 + r3
+        if s <= 1e-9:
+            r1, r2, r3 = 0.12, 0.70, 0.18
+            s = r1 + r2 + r3
+        self.phase_runin_ratio = r1 / s
+        self.phase_stable_ratio = r2 / s
+        self.phase_severe_ratio = r3 / s
+
+        # 兼容旧边界字段（用于旧逻辑/输出）
+        self.runin_ratio = float(self.phase_runin_ratio)
+        self.severe_start_ratio = float(self.phase_runin_ratio + self.phase_stable_ratio)
+        self.severe_start_ratio = max(self.runin_ratio + 1e-6, min(0.999999, self.severe_start_ratio))
+
+        # μ 范围合法性（min/max 自动交换）
+        def _fix_pair(a, b):
+            a = float(a); b = float(b)
+            if a > b:
+                a, b = b, a
+            return a, b
+
+        self.mu_runin_min, self.mu_runin_max = _fix_pair(self.mu_runin_min, self.mu_runin_max)
+        self.mu_stable_min, self.mu_stable_max = _fix_pair(self.mu_stable_min, self.mu_stable_max)
+        self.mu_severe_min, self.mu_severe_max = _fix_pair(self.mu_severe_min, self.mu_severe_max)
+
+        # 简单裁剪（避免极端输入）
+        def _clip_mu(x):
+            return max(0.0, min(2.0, float(x)))
+
+        self.mu_runin_min = _clip_mu(self.mu_runin_min)
+        self.mu_runin_max = _clip_mu(self.mu_runin_max)
+        self.mu_stable_min = _clip_mu(self.mu_stable_min)
+        self.mu_stable_max = _clip_mu(self.mu_stable_max)
+        self.mu_severe_min = _clip_mu(self.mu_severe_min)
+        self.mu_severe_max = _clip_mu(self.mu_severe_max)
+
+        # 确保 severe 上限不小于 stable 上限
+        if self.mu_severe_max < self.mu_stable_max:
+            self.mu_severe_max = self.mu_stable_max
+
     def mech_freq(self) -> float:
         """机械主频（Hz）"""
         return (float(self.rpm) / 60.0) * float(self.mech_harmonic)
@@ -314,34 +378,106 @@ class SimConfig:
         return _notch_q_from_rpm(self.rpm)
 
 
-def _mu_profile(t: np.ndarray, cfg: SimConfig) -> np.ndarray:
-    """μ(t) 真值：磨合回落 → 稳定 → 剧烈磨损上升"""
-    T = t[-1] if len(t) else 0.0
+def _pick_mu_anchors(cfg: SimConfig, rng: np.random.Generator):
+    """
+    根据三阶段 μ 范围生成本次仿真的“使用值”
+    - 若 min==max => 固定值
+    - 使用 rng，保证同一 seed 可重复
+    """
+    def u(a, b):
+        a = float(a); b = float(b)
+        if abs(a - b) < 1e-12:
+            return float(a)
+        lo, hi = (a, b) if a <= b else (b, a)
+        return float(rng.uniform(lo, hi))
+
+    mu_st = u(cfg.mu_stable_min, cfg.mu_stable_max)
+    mu_r0 = u(cfg.mu_runin_min, cfg.mu_runin_max)
+    if mu_r0 < mu_st:
+        mu_r0 = min(float(cfg.mu_runin_max), mu_st + 0.05)
+
+    mu_se = u(cfg.mu_severe_min, cfg.mu_severe_max)
+    if mu_se < mu_st + 0.05:
+        mu_se = min(float(cfg.mu_severe_max), mu_st + 0.10)
+
+    # 最后再裁剪一次
+    mu_r0 = float(max(cfg.mu_runin_min, min(cfg.mu_runin_max, mu_r0)))
+    mu_st = float(max(cfg.mu_stable_min, min(cfg.mu_stable_max, mu_st)))
+    mu_se = float(max(cfg.mu_severe_min, min(cfg.mu_severe_max, mu_se)))
+    return mu_r0, mu_st, mu_se
+
+
+def _mu_profile(t: np.ndarray, cfg: SimConfig, mu_runin_start: float, mu_stable: float, mu_severe_end: float) -> np.ndarray:
+    """
+    μ(t) 真值：磨合 → 稳定 → 加速磨损（连续）
+    说明（重要）：
+    - 仅对“锚点”做范围约束（μrunin_start、μstable、μsevere_end），曲线本身用连续映射生成；
+      避免对每个采样点做 clip 导致段间边界跳变（不连续）。
+    - 三段边界处强制连续：μ(t_runin-) = μ(t_runin+)；μ(t_severe-) = μ(t_severe+)
+    """
+    T = float(t[-1]) if len(t) else 0.0
     if T <= 0:
         return np.array([], dtype=float)
 
-    t_runin = cfg.runin_ratio * T
-    t_severe = cfg.severe_start_ratio * T
+    # 阶段比例（已在 cfg.validate() 中归一化，这里再做一次保护）
+    r1 = max(0.0, float(cfg.phase_runin_ratio))
+    r2 = max(0.0, float(cfg.phase_stable_ratio))
+    r3 = max(0.0, float(cfg.phase_severe_ratio))
+    s = max(1e-9, r1 + r2 + r3)
+    r1, r2, r3 = r1 / s, r2 / s, r3 / s
+
+    t_runin = max(0.0, min(T, r1 * T))
+    t_severe = max(t_runin, min(T, (r1 + r2) * T))
+
+    # 锚点（仅锚点范围约束，避免段间不连续）
+    mu_st0 = float(np.clip(mu_stable, cfg.mu_stable_min, cfg.mu_stable_max))
+    mu_r0 = float(np.clip(mu_runin_start, cfg.mu_runin_min, cfg.mu_runin_max))
+    mu_se = float(np.clip(mu_severe_end, cfg.mu_severe_min, cfg.mu_severe_max))
+
+    # 约束基本顺序（保证合理单调关系）
+    if mu_r0 < mu_st0:
+        mu_r0 = mu_st0
+    # 稳定段末端：给一个很小的漂移（可在后续加为参数）
+    mu_st1 = float(np.clip(mu_st0 + 0.02, cfg.mu_stable_min, cfg.mu_stable_max))
+    if mu_se < mu_st1:
+        mu_se = mu_st1
 
     mu = np.empty_like(t, dtype=float)
 
-    idx1 = t <= t_runin
-    if np.any(idx1):
-        tau = max(1e-6, 0.25 * t_runin)
-        mu[idx1] = cfg.mu_stable + (cfg.mu_runin_start - cfg.mu_stable) * np.exp(-t[idx1] / tau)
+    # 1) 磨合段：指数衰减（归一化保证 t=t_runin 时刚好到 μst0）
+    if t_runin <= 1.0 / max(1e-9, cfg.fs_Hz):
+        # 磨合段几乎为0：直接从稳定段开始
+        idx1 = t <= t_runin
+        if np.any(idx1):
+            mu[idx1] = mu_st0
+    else:
+        idx1 = t <= t_runin
+        if np.any(idx1):
+            tau = max(1e-6, 0.25 * t_runin)
+            e1 = np.exp(-t_runin / tau)
+            den = max(1e-12, 1.0 - e1)
+            w = (np.exp(-t[idx1] / tau) - e1) / den   # t=0 ->1, t=t_runin ->0
+            mu[idx1] = mu_st0 + (mu_r0 - mu_st0) * w
 
+    # 2) 稳定段：轻微漂移（线性，保证边界连续）
     idx2 = (t > t_runin) & (t <= t_severe)
     if np.any(idx2):
         span = max(1e-6, (t_severe - t_runin))
-        drift = 0.02 * (t[idx2] - t_runin) / span
-        mu[idx2] = cfg.mu_stable + drift
+        x = (t[idx2] - t_runin) / span  # 0..1
+        mu[idx2] = mu_st0 + (mu_st1 - mu_st0) * x
 
+    # 3) 加速磨损：S型上升（归一化 sigmoid，保证起点=μst1，终点=μse）
     idx3 = t > t_severe
     if np.any(idx3):
         span = max(1e-6, (T - t_severe))
-        x = (t[idx3] - t_severe) / span
-        s = 1.0 / (1.0 + np.exp(-10 * (x - 0.35)))
-        mu[idx3] = (cfg.mu_stable + 0.02) + (cfg.mu_severe_end - (cfg.mu_stable + 0.02)) * s
+        x = (t[idx3] - t_severe) / span  # 0..1
+        k = 10.0
+        sig = 1.0 / (1.0 + np.exp(-k * (x - 0.5)))
+        s0 = 1.0 / (1.0 + np.exp(-k * (0.0 - 0.5)))
+        s1 = 1.0 / (1.0 + np.exp(-k * (1.0 - 0.5)))
+        den = max(1e-12, (s1 - s0))
+        sn = (sig - s0) / den  # x=0 ->0, x=1 ->1
+        mu[idx3] = mu_st1 + (mu_se - mu_st1) * sn
 
     # 微弱高频成分（非机械主频）
     mu += 0.002 * np.sin(2 * np.pi * 0.2 * t)
@@ -501,7 +637,7 @@ def _find_stable_segments(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, 
     return segs
 
 
-def _find_failure_time(mu_f: np.ndarray, t: np.ndarray, mu_ss: Optional[float], cfg: SimConfig):
+def _find_failure_time(mu_f: np.ndarray, t: np.ndarray, mu_ss: Optional[float], cfg: SimConfig, start_idx: int = 0):
     """寿命判据：μ 持续超过 μth=μss*(1+δ) 持续 W_hold，输出 tlife"""
     if mu_ss is None or not np.isfinite(mu_ss):
         return None, None
@@ -509,9 +645,13 @@ def _find_failure_time(mu_f: np.ndarray, t: np.ndarray, mu_ss: Optional[float], 
     hold = int(round(cfg.fail_hold_s * cfg.fs_Hz))
     hold = max(1, hold)
 
+    # 关键修复：失效判定从 start_idx 开始（通常取稳定段基线窗口结束），避免磨合段 μ 偏高导致 tlife=0s
+    start_idx = int(max(0, min(len(mu_f) - 1, start_idx)))
+
     above = np.isfinite(mu_f) & (mu_f > mu_th)
     count = 0
-    for i, a in enumerate(above):
+    for i in range(start_idx, len(above)):
+        a = bool(above[i])
         if a:
             count += 1
             if count >= hold:
@@ -533,7 +673,8 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     t = np.arange(n, dtype=float) / float(cfg.fs_Hz)
 
     _cb(progress_cb, 12.0, "生成 μ(t) 真值...")
-    mu_true = _mu_profile(t, cfg)
+    mu_runin_start_used, mu_stable_used, mu_severe_end_used = _pick_mu_anchors(cfg, rng)
+    mu_true = _mu_profile(t, cfg, mu_runin_start_used, mu_stable_used, mu_severe_end_used)
 
     _cb(progress_cb, 18.0, "生成开环/闭环平均张力...")
     tavg_open, tavg_closed = _make_tavg_open_closed(t, cfg, rng)
@@ -567,27 +708,34 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     mu_cl_lp[q_cl == 0] = np.nan
 
     _cb(progress_cb, 48.0, "稳定段基线与寿命判据计算...")
-    # 1) 先识别“全时域”的连续稳定段（用于可视化），后续绘图会在 tlife 右侧裁剪掉
+    # 1) 先识别“全时域”的连续稳定段（用于可视化）；绘图时再裁剪 tlife 右侧
     stable_segs_all = _find_stable_segments(mu_cl_lp, t, q_cl, cfg, end_idx=None)
 
-    # 2) 计算基线 μss：优先在“失效前”段落内求；若尚未失效，则使用全时域
-    #    先粗略用全时域求 μss，再求 tlife；再把基线限制在 tlife 之前重新求一次（更符合工程意义）
+    # 2) 先在全时域寻找稳定段基线 μss（得到稳定窗口 stable_idx0）
     stable_idx0, mu_ss0 = _find_stable_baseline(mu_cl_lp, t, q_cl, cfg, end_idx=None)
-    tlife, mu_th = _find_failure_time(mu_cl_lp, t, mu_ss0, cfg)
 
+    # 3) 初步计算 tlife（从稳定窗口结束开始判定，避免磨合段 μ 偏高导致 tlife=0s）
+    start_fail_idx0 = int(stable_idx0[1]) if (stable_idx0 is not None) else 0
+    tlife0, mu_th0 = _find_failure_time(mu_cl_lp, t, mu_ss0, cfg, start_idx=start_fail_idx0)
+
+    # 4) 若存在 tlife0，则优先在 tlife0 之前重算 μss（更符合“失效前基线”意义）；否则沿用全时域
+    tlife = tlife0
+    mu_th = mu_th0
     tlife_idx = None
-    if tlife is not None:
-        tlife_idx = int(max(0, min(len(t) - 1, round(float(tlife) * cfg.fs_Hz))))
+    if tlife0 is not None:
+        tlife_idx = int(max(1, min(len(t), int(round(float(tlife0) * cfg.fs_Hz)) + 1)))
         stable_idx, mu_ss = _find_stable_baseline(mu_cl_lp, t, q_cl, cfg, end_idx=tlife_idx)
-        # 若失效前找不到稳定段，则回退到全时域
         if mu_ss is None or not np.isfinite(mu_ss):
             stable_idx, mu_ss = stable_idx0, mu_ss0
     else:
         stable_idx, mu_ss = stable_idx0, mu_ss0
 
-    # 3) 用最终 μss 更新 μth（保持一致）
+    # 5) 用最终 μss 重新计算 tlife 与 μth（同样从稳定窗口结束开始）
     if mu_ss is not None and np.isfinite(mu_ss):
-        mu_th = float(mu_ss * (1.0 + cfg.fail_delta))
+        start_fail_idx = int(stable_idx[1]) if (stable_idx is not None) else 0
+        tlife, mu_th = _find_failure_time(mu_cl_lp, t, mu_ss, cfg, start_idx=start_fail_idx)
+        if tlife is not None:
+            tlife_idx = int(max(1, min(len(t), int(round(float(tlife) * cfg.fs_Hz)) + 1)))
 
     stable_segs = stable_segs_all
 
@@ -597,6 +745,12 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
         "derived": {
             "mech_freq_hz_used": float(f_mech),
             "notch_q_used": float(q_notch),
+            "mu_runin_start_used": float(mu_runin_start_used),
+            "mu_stable_used": float(mu_stable_used),
+            "mu_severe_end_used": float(mu_severe_end_used),
+            "phase_runin_ratio_used": float(cfg.phase_runin_ratio),
+            "phase_stable_ratio_used": float(cfg.phase_stable_ratio),
+            "phase_severe_ratio_used": float(cfg.phase_severe_ratio),
         },
         "series": {
             "t": t,
@@ -640,6 +794,12 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
         "t_avg_N": ds(cl["tavg"]),
         "f_fric_N": ds(cl["ff"]),
         "mu_true": ds(res["series"]["mu_true"]),
+        "mu_runin_start_used": np.full_like(t_e, float(res["derived"].get("mu_runin_start_used", np.nan)), dtype=float),
+        "mu_stable_used": np.full_like(t_e, float(res["derived"].get("mu_stable_used", np.nan)), dtype=float),
+        "mu_severe_end_used": np.full_like(t_e, float(res["derived"].get("mu_severe_end_used", np.nan)), dtype=float),
+        "phase_runin_ratio": np.full_like(t_e, float(res["derived"].get("phase_runin_ratio_used", np.nan)), dtype=float),
+        "phase_stable_ratio": np.full_like(t_e, float(res["derived"].get("phase_stable_ratio_used", np.nan)), dtype=float),
+        "phase_severe_ratio": np.full_like(t_e, float(res["derived"].get("phase_severe_ratio_used", np.nan)), dtype=float),
         "mu_raw": ds(cl["mu_raw"]),
         "mu_hampel": ds(cl["mu_hampel"]),
         "mu_notch": ds(cl["mu_notch"]),
@@ -659,6 +819,12 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
         "t_avg_N": ds(op["tavg"]),
         "f_fric_N": ds(op["ff"]),
         "mu_true": ds(res["series"]["mu_true"]),
+        "mu_runin_start_used": np.full_like(t_e, float(res["derived"].get("mu_runin_start_used", np.nan)), dtype=float),
+        "mu_stable_used": np.full_like(t_e, float(res["derived"].get("mu_stable_used", np.nan)), dtype=float),
+        "mu_severe_end_used": np.full_like(t_e, float(res["derived"].get("mu_severe_end_used", np.nan)), dtype=float),
+        "phase_runin_ratio": np.full_like(t_e, float(res["derived"].get("phase_runin_ratio_used", np.nan)), dtype=float),
+        "phase_stable_ratio": np.full_like(t_e, float(res["derived"].get("phase_stable_ratio_used", np.nan)), dtype=float),
+        "phase_severe_ratio": np.full_like(t_e, float(res["derived"].get("phase_severe_ratio_used", np.nan)), dtype=float),
         "mu_raw": ds(op["mu_raw"]),
         "q_valid": ds(op["q"]).astype(int),
         "rpm": np.full_like(t_e, float(cfg.rpm), dtype=float),
