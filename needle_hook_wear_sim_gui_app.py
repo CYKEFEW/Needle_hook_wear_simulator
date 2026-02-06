@@ -17,6 +17,7 @@ import configparser
 from pathlib import Path
 import threading
 import queue
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -37,7 +38,8 @@ class App(tk.Tk):
         self.title("针钩磨损检测全过程仿真（Capstan + 扰动 + 滤波 + 判据）")
         # 设置窗口左上角图标（Windows）
         try:
-            icon_path = Path(__file__).resolve().parent / "app.ico"
+            base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+            icon_path = base_dir / "app.ico"
             if icon_path.exists():
                 self.iconbitmap(str(icon_path))
         except Exception:

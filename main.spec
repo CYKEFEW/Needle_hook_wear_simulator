@@ -7,6 +7,7 @@ block_cipher = None
 datas = []
 datas += collect_data_files("matplotlib")
 datas += [("defaultData.ini", ".")]
+datas += [("app.ico", ".")]
 
 hiddenimports = []
 hiddenimports += collect_submodules("matplotlib")
@@ -34,14 +35,7 @@ exe = EXE(
     name="needle_hook_wear_sim",
     console=False,
     icon="app.ico",
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+    onefile=True,
     strip=False,
     upx=True,
-    name="needle_hook_wear_sim",
 )
