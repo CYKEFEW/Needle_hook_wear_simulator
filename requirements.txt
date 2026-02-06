@@ -1,5 +1,6 @@
 numpy
 pandas
 openpyxl
+xlsxwriter
 matplotlib
 # scipy  # 可选：安装后陷波/低通更快更标准
