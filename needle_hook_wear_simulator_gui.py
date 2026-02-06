@@ -1223,6 +1223,7 @@ def export_plots(
             "tavg": "Mean tension (N)",
             "mu": "Friction coefficient μ",
             "title_closed_t": "Closed-loop: Tension vs Time",
+            "title_open_t": "Open-loop: Tension vs Time",
             "title_mu": "Closed-loop: μ vs Time (μss & μth)",
             "title_cmp": "Open-loop vs Closed-loop: Mean Tension",
             "th": "T_high",
@@ -1243,6 +1244,7 @@ def export_plots(
             "tavg": "平均张力 (N)",
             "mu": "摩擦系数 μ",
             "title_closed_t": "闭环：张力-时间",
+            "title_open_t": "开环：张力-时间",
             "title_mu": "闭环：摩擦系数-时间（μss 与 μth）",
             "title_cmp": "开环 vs 闭环：平均张力稳定性对比",
             "th": "高张力侧 T_high",
@@ -1271,12 +1273,30 @@ def export_plots(
     plt.title(L["title_closed_t"])
     _legend_below_center(ncol=3)
     plt.tight_layout(rect=[0, 0.10, 1, 1])
-    p1 = os.path.join(plot_dir, f"closed_tensions_{lang}.png")
-    plt.savefig(p1, dpi=180)
+    p_closed = os.path.join(plot_dir, f"closed_tensions_{lang}.png")
+    plt.savefig(p_closed, dpi=180)
     plt.close()
 
-    # 2) μ-时间（含 μss、μth、稳定段并集、tlife线）
-    _cb(progress_cb, 75.0, "绘图：μ-时间（含 μss/μth/稳定段/tlife）...")
+    # 2) 开环张力-时间
+    _cb(progress_cb, 67.0, "绘图：开环张力-时间...")
+    tx, y1 = _downsample_for_plot(t, op["th"], cfg.plot_max_points)
+    _, y2 = _downsample_for_plot(t, op["tl"], cfg.plot_max_points)
+    _, y3 = _downsample_for_plot(t, op["tavg"], cfg.plot_max_points)
+    plt.figure()
+    plt.plot(tx, y1, label=L["th"], color="tab:blue")
+    plt.plot(tx, y2, label=L["tl"], color="tab:orange")
+    plt.plot(tx, y3, label=L["ta"], color="tab:green")
+    plt.xlabel(L["t"])
+    plt.ylabel(L["tension"])
+    plt.title(L["title_open_t"])
+    _legend_below_center(ncol=3)
+    plt.tight_layout(rect=[0, 0.10, 1, 1])
+    p_open = os.path.join(plot_dir, f"open_tensions_{lang}.png")
+    plt.savefig(p_open, dpi=180)
+    plt.close()
+
+    # 3) μ-时间（含 μss、μth、稳定段并集、tlife线）
+    _cb(progress_cb, 78.0, "绘图：μ-时间（含 μss/μth/稳定段/tlife）...")
     tx, muf = _downsample_for_plot(t, mu_f, cfg.plot_max_points)
     plt.figure()
     plt.plot(tx, muf, label=L["mu_f"], color="tab:blue")
@@ -1310,12 +1330,12 @@ def export_plots(
     plt.title(L["title_mu"])
     _legend_below_center(ncol=2)
     plt.tight_layout(rect=[0, 0.14, 1, 1])
-    p2 = os.path.join(plot_dir, f"mu_with_baseline_threshold_{lang}.png")
-    plt.savefig(p2, dpi=180)
+    p_mu = os.path.join(plot_dir, f"mu_with_baseline_threshold_{lang}.png")
+    plt.savefig(p_mu, dpi=180)
     plt.close()
 
-    # 3) 开环 vs 闭环平均张力
-    _cb(progress_cb, 90.0, "绘图：开环 vs 闭环平均张力...")
+    # 4) 开环 vs 闭环平均张力
+    _cb(progress_cb, 92.0, "绘图：开环 vs 闭环平均张力...")
 
     # 对比输出范围：支持设置 [t_start, t_end]，(0,-1) 表示全部
     t0_cmp = float(getattr(cfg, "compare_t_start_s", 0.0))
@@ -1349,12 +1369,18 @@ def export_plots(
     plt.title(L["title_cmp"])
     _legend_below_center(ncol=2)
     plt.tight_layout(rect=[0, 0.10, 1, 1])
-    p3 = os.path.join(plot_dir, f"open_vs_closed_tavg_{lang}.png")
-    plt.savefig(p3, dpi=180)
+    p_cmp = os.path.join(plot_dir, f"open_vs_closed_tavg_{lang}.png")
+    plt.savefig(p_cmp, dpi=180)
     plt.close()
 
     _cb(progress_cb, 100.0, "图片导出完成")
-    return {"plot_closed_tensions": p1, "plot_mu": p2, "plot_open_vs_closed": p3, "plot_dir": plot_dir}
+    return {
+        "plot_closed_tensions": p_closed,
+        "plot_open_tensions": p_open,
+        "plot_mu": p_mu,
+        "plot_open_vs_closed": p_cmp,
+        "plot_dir": plot_dir,
+    }
 
 
 def export_summary(res: Dict[str, Any], out_dir: str, extra: Optional[Dict[str, Any]] = None) -> str:
