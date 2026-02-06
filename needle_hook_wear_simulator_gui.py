@@ -23,9 +23,10 @@ needle_hook_wear_simulator_gui.py
 
 import os
 import json
+import math
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, Callable, List, Tuple
-import math
+
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -252,23 +253,23 @@ def _write_xlsx_multisheet(
 @dataclass
 class SimConfig:
     # 核心输入：fs 与 duration 仅用于生成时间轴
-    theta_deg: float = 20.0
-    t_set_N: float = 5.0
+    theta_deg: float = 100.0
+    t_set_N: float = 0.5
     fs_Hz: float = 50.0
-    duration_s: float = 3600.0
+    duration_s: float = 36000.0
 
     # 机械扰动：仅由 rpm 换算
     rpm: float = 300.0
     mech_harmonic: int = 1
 
     # 扰动（开环明显，闭环衰减）
-    noise_rms_open: float = 0.25
-    noise_rms_closed: float = 0.08
-    mech_amp_open: float = 0.6
-    mech_amp_closed: float = 0.12
-    drift_amp_open: float = 0.8
-    drift_amp_closed: float = 0.15
-    drift_freq_hz: float = 0.01
+    noise_rms_open: float = 0.0275
+    noise_rms_closed: float = 0.008
+    mech_amp_open: float = 0.09
+    mech_amp_closed: float = 0.02
+    drift_amp_open: float = 0.055
+    drift_amp_closed: float = 0.02
+    drift_freq_hz: float = 0.000175
 
     # 阶段时间比例（三段之和会在 validate() 中归一化为 1）
     # - GUI 使用滑块直接调这三个比例
@@ -286,6 +287,18 @@ class SimConfig:
     mu_severe_min: float = 0.35
     mu_severe_max: float = 0.60
 
+
+    # 阶段过渡速度系数（用于调整“段间过渡速度”，保证连续）
+    # - 磨合→稳定：系数越大，衰减越快（过渡越快）
+    # - 稳定→加速：系数越大，S 形上升越陡（过渡越快）
+    trans_runin2stable_k: float = 1.0
+    trans_stable2severe_k: float = 1.0
+
+    # 开环-闭环对比输出范围（单位：s）
+    # - (0, -1) 表示全部输出（默认）
+    compare_t_start_s: float = 0.0
+    compare_t_end_s: float = -1.0
+
     # 兼容旧字段（内部会根据“范围”生成使用值，并写入 derived 输出）
     mu_runin_start: float = 0.35
     mu_stable: float = 0.25
@@ -294,25 +307,68 @@ class SimConfig:
     severe_start_ratio: float = 0.82
 
     # 张力测量噪声
-    sensor_rms: float = 0.06
+    sensor_rms: float = 0.005
+
+
+    # ===== 扰动参数范围设置（用于准周期/不确定扰动；单位同原参数）=====
+    # 说明：*_min/*_max 为范围；若只需固定值，可令 min=max。
+
+    # 高频噪声强度（RMS，N）
+    noise_rms_open_min: float = 0.015
+    noise_rms_open_max: float = 0.040
+    noise_rms_closed_min: float = 0.004
+    noise_rms_closed_max: float = 0.012
+
+    # 机械周期扰动幅值（N）
+    mech_amp_open_min: float = 0.06
+    mech_amp_open_max: float = 0.12
+    mech_amp_closed_min: float = 0.01
+    mech_amp_closed_max: float = 0.03
+
+    # 低频准周期漂移幅值（N）
+    drift_amp_open_min: float = 0.03
+    drift_amp_open_max: float = 0.08
+    drift_amp_closed_min: float = 0.01
+    drift_amp_closed_max: float = 0.03
+
+    # 低频漂移频率范围（Hz）：准周期 -> 两频率分量叠加
+    drift_freq_hz_min: float = 0.00005
+    drift_freq_hz_max: float = 0.00030
+
+    # 传感器测量噪声（RMS，N）
+    sensor_rms_min: float = 0.002
+    sensor_rms_max: float = 0.008
+
+    # 慢变时间常数（s）：用于让扰动“范围随时间慢变”（更接近真实准周期/工况漂移）
+    # - <=0 表示不启用慢变：仍按“每次仿真从范围内抽一次常量”的旧逻辑（兼容）
+    # - 建议：机械周期扰动/噪声RMS 的 τ 取 300~3000s；漂移相关 τ 取 1800~20000s
+    tau_mech_s: float = 1200.0
+    tau_noise_s: float = 900.0
+    tau_sensor_s: float = 900.0
+    tau_drift_amp_s: float = 7200.0
+    tau_drift_freq_s: float = 7200.0
 
     # 门控/裁剪（抑制“比值+对数”放大）
-    tmin_gate_N: float = 0.5
-    ratio_clip_min: float = 0.2
-    ratio_clip_max: float = 30.0
+    tmin_gate_N: float = 0.08
+    ratio_clip_min: float = 0.3
+    ratio_clip_max: float = 8.0
 
     # 滤波
-    hampel_win_s: float = 0.8
+    hampel_win_s: float = 1.0
     hampel_nsig: float = 3.0
-    lowpass_fc_hz: float = 2.0
+    lowpass_fc_hz: float = 2.5
 
     # 稳定段/寿命判据
-    stable_win_s: float = 120.0
+    stable_win_s: float = 300.0
+    # 最短连续稳定段时长 Whold（s）：用于判定“连续稳定段”是否成立
+    # - 若连续稳定窗口并集覆盖时间 < Whold，则该段不计为稳定段，也不用于 μss 计算
+    stable_hold_s: float = 3600.0
+
     stable_sigma_max: float = 0.05  # 默认 0.05
-    stable_slope_max: float = 1e-4
+    stable_slope_max: float = 0.015  # Δμ_max：稳定窗口内允许的最大总漂移量（默认按 Wss=300s 约等效 5e-5/s）
     stable_valid_min: float = 0.9
     fail_delta: float = 0.25
-    fail_hold_s: float = 30.0
+    fail_hold_s: float = 60.0
 
     # 导出/绘图
     export_stride: int = 1
@@ -344,6 +400,70 @@ class SimConfig:
         self.severe_start_ratio = max(self.runin_ratio + 1e-6, min(0.999999, self.severe_start_ratio))
 
         # μ 范围合法性（min/max 自动交换）
+        # 过渡速度系数范围保护
+        self.trans_runin2stable_k = float(max(0.05, min(20.0, self.trans_runin2stable_k)))
+        self.trans_stable2severe_k = float(max(0.05, min(20.0, self.trans_stable2severe_k)))
+
+        # 开环-闭环对比输出范围保护
+        self.compare_t_start_s = float(max(0.0, self.compare_t_start_s))
+        if float(self.compare_t_end_s) != -1.0:
+            self.compare_t_end_s = float(max(self.compare_t_start_s, self.compare_t_end_s))        # 连续稳定段最短时长（s）
+        self.stable_hold_s = float(max(0.0, self.stable_hold_s))        # 兼容旧版本：若 stable_slope_max 非常小（<1e-3），通常表示“斜率阈值(1/s)”，自动换算为总漂移量阈值
+        # Δμ_max ≈ g_max * Wss
+        if float(self.stable_slope_max) < 1e-3:
+            self.stable_slope_max = float(self.stable_slope_max) * float(self.stable_win_s)
+        # 最小下限保护
+        self.stable_slope_max = float(max(0.0, self.stable_slope_max))
+        # 扰动范围参数：确保 min<=max，且不为负
+        def _clamp_range(a: float, b: float, lo: float = 0.0, hi: float = 1e9):
+            a = float(max(lo, min(hi, a)))
+            b = float(max(lo, min(hi, b)))
+            if a > b:
+                a, b = b, a
+            return a, b
+
+        self.noise_rms_open_min, self.noise_rms_open_max = _clamp_range(getattr(self, "noise_rms_open_min", self.noise_rms_open),
+                                                                         getattr(self, "noise_rms_open_max", self.noise_rms_open),
+                                                                         lo=0.0)
+        self.noise_rms_closed_min, self.noise_rms_closed_max = _clamp_range(getattr(self, "noise_rms_closed_min", self.noise_rms_closed),
+                                                                             getattr(self, "noise_rms_closed_max", self.noise_rms_closed),
+                                                                             lo=0.0)
+
+        self.mech_amp_open_min, self.mech_amp_open_max = _clamp_range(getattr(self, "mech_amp_open_min", self.mech_amp_open),
+                                                                      getattr(self, "mech_amp_open_max", self.mech_amp_open),
+                                                                      lo=0.0)
+        self.mech_amp_closed_min, self.mech_amp_closed_max = _clamp_range(getattr(self, "mech_amp_closed_min", self.mech_amp_closed),
+                                                                          getattr(self, "mech_amp_closed_max", self.mech_amp_closed),
+                                                                          lo=0.0)
+
+        self.drift_amp_open_min, self.drift_amp_open_max = _clamp_range(getattr(self, "drift_amp_open_min", self.drift_amp_open),
+                                                                        getattr(self, "drift_amp_open_max", self.drift_amp_open),
+                                                                        lo=0.0)
+        self.drift_amp_closed_min, self.drift_amp_closed_max = _clamp_range(getattr(self, "drift_amp_closed_min", self.drift_amp_closed),
+                                                                            getattr(self, "drift_amp_closed_max", self.drift_amp_closed),
+                                                                            lo=0.0)
+
+        self.drift_freq_hz_min, self.drift_freq_hz_max = _clamp_range(getattr(self, "drift_freq_hz_min", self.drift_freq_hz),
+                                                                      getattr(self, "drift_freq_hz_max", self.drift_freq_hz),
+                                                                      lo=0.0, hi=1.0)
+
+        self.sensor_rms_min, self.sensor_rms_max = _clamp_range(getattr(self, "sensor_rms_min", self.sensor_rms),
+                                                                getattr(self, "sensor_rms_max", self.sensor_rms),
+                                                                lo=0.0)
+
+        # 将范围中点写回标称值（保持兼容：cfg.noise_rms_open 等字段始终有合理值）
+        self.noise_rms_open = 0.5 * (self.noise_rms_open_min + self.noise_rms_open_max)
+        self.noise_rms_closed = 0.5 * (self.noise_rms_closed_min + self.noise_rms_closed_max)
+        self.mech_amp_open = 0.5 * (self.mech_amp_open_min + self.mech_amp_open_max)
+        self.mech_amp_closed = 0.5 * (self.mech_amp_closed_min + self.mech_amp_closed_max)
+        self.drift_amp_open = 0.5 * (self.drift_amp_open_min + self.drift_amp_open_max)
+        self.drift_amp_closed = 0.5 * (self.drift_amp_closed_min + self.drift_amp_closed_max)
+        self.drift_freq_hz = 0.5 * (self.drift_freq_hz_min + self.drift_freq_hz_max)
+        self.sensor_rms = 0.5 * (self.sensor_rms_min + self.sensor_rms_max)
+
+
+
+
         def _fix_pair(a, b):
             a = float(a); b = float(b)
             if a > b:
@@ -368,6 +488,18 @@ class SimConfig:
         # 确保 severe 上限不小于 stable 上限
         if self.mu_severe_max < self.mu_stable_max:
             self.mu_severe_max = self.mu_stable_max
+
+        # 慢变时间常数：>=0（<=0 表示关闭慢变，保持旧逻辑）
+        for _k in ["tau_mech_s", "tau_noise_s", "tau_sensor_s", "tau_drift_amp_s", "tau_drift_freq_s"]:
+            if hasattr(self, _k):
+                try:
+                    v = float(getattr(self, _k))
+                except Exception:
+                    v = 0.0
+                if not np.isfinite(v):
+                    v = 0.0
+                setattr(self, _k, max(0.0, v))
+
 
     def mech_freq(self) -> float:
         """机械主频（Hz）"""
@@ -453,7 +585,8 @@ def _mu_profile(t: np.ndarray, cfg: SimConfig, mu_runin_start: float, mu_stable:
     else:
         idx1 = t <= t_runin
         if np.any(idx1):
-            tau = max(1e-6, 0.25 * t_runin)
+            k_rs = float(max(0.05, getattr(cfg, 'trans_runin2stable_k', 1.0)))
+            tau = max(1e-6, (0.25 * t_runin) / k_rs)
             e1 = np.exp(-t_runin / tau)
             den = max(1e-12, 1.0 - e1)
             w = (np.exp(-t[idx1] / tau) - e1) / den   # t=0 ->1, t=t_runin ->0
@@ -471,7 +604,8 @@ def _mu_profile(t: np.ndarray, cfg: SimConfig, mu_runin_start: float, mu_stable:
     if np.any(idx3):
         span = max(1e-6, (T - t_severe))
         x = (t[idx3] - t_severe) / span  # 0..1
-        k = 10.0
+        k_sa = float(max(0.05, getattr(cfg, 'trans_stable2severe_k', 1.0)))
+        k = 10.0 * k_sa
         sig = 1.0 / (1.0 + np.exp(-k * (x - 0.5)))
         s0 = 1.0 / (1.0 + np.exp(-k * (0.0 - 0.5)))
         s1 = 1.0 / (1.0 + np.exp(-k * (1.0 - 0.5)))
@@ -484,30 +618,182 @@ def _mu_profile(t: np.ndarray, cfg: SimConfig, mu_runin_start: float, mu_stable:
     return mu
 
 
+def _rand_in_range(a: float, b: float, rng: np.random.Generator) -> float:
+    a = float(a); b = float(b)
+    if a > b:
+        a, b = b, a
+    if abs(a - b) < 1e-15:
+        return a
+    return float(rng.uniform(a, b))
+
+
+def _slow_bounded_series(
+    t: np.ndarray,
+    vmin: float,
+    vmax: float,
+    tau_s: float,
+    rng: np.random.Generator,
+    sigma_z: float = 0.35,
+    z0: float | None = None,
+) -> np.ndarray:
+    """生成在 [vmin, vmax] 内缓慢变化的随机序列。
+
+    机制：
+    - 在无界变量 z 上做 OU 慢漂移（时间常数 tau_s）
+    - 再用 tanh 压缩映射到 [vmin, vmax]，保证永不越界
+    """
+    vmin = float(vmin); vmax = float(vmax)
+    if vmin > vmax:
+        vmin, vmax = vmax, vmin
+    if len(t) == 0:
+        return np.array([], dtype=float)
+
+    # 退化情形：不启用慢变 / 范围退化 -> 常量
+    if tau_s is None:
+        tau_s = 0.0
+    tau_s = float(tau_s)
+    if tau_s <= 0.0 or abs(vmax - vmin) < 1e-15:
+        v0 = _rand_in_range(vmin, vmax, rng)
+        return np.full_like(t, v0, dtype=float)
+
+    # 以均匀 dt 近似（仿真本身就是等间隔采样）
+    if len(t) >= 2:
+        dt = float(np.median(np.diff(t)))
+    else:
+        dt = 1.0
+
+    dt = max(dt, 1e-6)
+    # OU: z_{k+1} = a z_k + b N(0,1)
+    a = math.exp(-dt / tau_s)
+    b = math.sqrt(max(0.0, 1.0 - a * a)) * sigma_z
+
+    if z0 is None:
+        z = float(rng.normal(0.0, 0.8))
+    else:
+        z = float(z0)
+
+    out = np.empty_like(t, dtype=float)
+    span = vmax - vmin
+    for i in range(len(t)):
+        # 映射到 [vmin, vmax]
+        u = 0.5 * (math.tanh(z) + 1.0)  # in (0,1)
+        out[i] = vmin + span * u
+        # 演化
+        z = a * z + b * float(rng.normal(0.0, 1.0))
+    return out
+
+
+def _make_quasi_drift(
+    t: np.ndarray,
+    amp_min: float,
+    amp_max: float,
+    f_min: float,
+    f_max: float,
+    rng: np.random.Generator,
+    tau_amp_s: float = 0.0,
+    tau_freq_s: float = 0.0,
+) -> np.ndarray:
+    """生成低频准周期漂移：两频率分量叠加（beat/准周期）。
+
+    相比旧版“整段只抽一次 A/f”，这里支持 A(t)、f(t) 在范围内慢变：
+    - tau_amp_s / tau_freq_s <= 0 时退化为旧逻辑（兼容）
+    """
+    # 幅值包络 A(t)
+    A_t = _slow_bounded_series(t, amp_min, amp_max, tau_amp_s, rng)
+
+    # 两个频率分量：f1(t), f2(t)（都在范围内慢变）
+    f1_t = _slow_bounded_series(t, f_min, f_max, tau_freq_s, rng, sigma_z=0.25, z0=float(rng.normal(0.0, 0.7)))
+    f2_t = _slow_bounded_series(t, f_min, f_max, tau_freq_s, rng, sigma_z=0.25, z0=float(rng.normal(0.0, 0.7)))
+
+    # 防止两者过于接近导致“看起来像单频”
+    span_f = float(max(1e-12, abs(f_max - f_min)))
+    sep = 0.05 * span_f
+    diff = np.abs(f2_t - f1_t)
+    if np.any(diff < sep):
+        # 对过近的点做轻微偏移并裁剪回范围
+        sign = np.where((f2_t - f1_t) >= 0.0, 1.0, -1.0)
+        f2_t = np.clip(f2_t + sign * sep, min(f_min, f_max), max(f_min, f_max))
+
+    # 幅值分配（随时间慢变的 A_t 作为总包络）
+    w = float(rng.uniform(0.55, 0.80))
+    a1_t = A_t * w
+    a2_t = np.maximum(0.0, A_t - a1_t) * float(rng.uniform(0.70, 1.20))
+
+    # 相位：对瞬时频率积分
+    if len(t) >= 2:
+        dt = float(np.median(np.diff(t)))
+    else:
+        dt = 1.0
+    dt = max(dt, 1e-6)
+
+    p1 = float(rng.uniform(0.0, 2.0 * np.pi))
+    p2 = float(rng.uniform(0.0, 2.0 * np.pi))
+    phi1 = 2.0 * np.pi * np.cumsum(f1_t) * dt + p1
+    phi2 = 2.0 * np.pi * np.cumsum(f2_t) * dt + p2
+
+    return a1_t * np.sin(phi1) + a2_t * np.sin(phi2)
+
+
+
 def _make_tavg_open_closed(t: np.ndarray, cfg: SimConfig, rng: np.random.Generator):
     """
     开环/闭环平均张力 T_avg(t)
     说明：不做逐步 PID 微步仿真，而是构造“开环=扰动明显，闭环=扰动衰减”的等效效果。
+
+    2026-02 更新：
+    - 机械周期扰动幅值 A_mech(t)、高频噪声 RMS(t)、低频漂移 A_drift(t)/f_drift(t)
+      支持在给定范围内“随时间慢变”（更贴近真实准周期/工况漂移）。
+    - 慢变速度由 cfg.tau_*_s 控制；tau<=0 时自动退化为旧逻辑（整段抽一次常量）。
     """
     f_mech = cfg.mech_freq()
 
-    drift_open = cfg.drift_amp_open * np.sin(2 * np.pi * cfg.drift_freq_hz * t + 0.3)
-    mech_open = cfg.mech_amp_open * np.sin(2 * np.pi * f_mech * t) \
-                + 0.3 * cfg.mech_amp_open * np.sin(2 * np.pi * (2 * f_mech) * t + 0.9)
-    noise_open = rng.normal(0.0, cfg.noise_rms_open, size=len(t))
+    # 机械周期扰动幅值（慢变）
+    mech_amp_open_t = _slow_bounded_series(
+        t, cfg.mech_amp_open_min, cfg.mech_amp_open_max, getattr(cfg, "tau_mech_s", 0.0), rng
+    )
+    mech_amp_closed_t = _slow_bounded_series(
+        t, cfg.mech_amp_closed_min, cfg.mech_amp_closed_max, getattr(cfg, "tau_mech_s", 0.0), rng
+    )
+
+    # 高频噪声 RMS（慢变）
+    noise_rms_open_t = _slow_bounded_series(
+        t, cfg.noise_rms_open_min, cfg.noise_rms_open_max, getattr(cfg, "tau_noise_s", 0.0), rng
+    )
+    noise_rms_closed_t = _slow_bounded_series(
+        t, cfg.noise_rms_closed_min, cfg.noise_rms_closed_max, getattr(cfg, "tau_noise_s", 0.0), rng
+    )
+
+    # 低频准周期漂移（beat）：幅值/频率均可慢变
+    drift_open = _make_quasi_drift(
+        t, cfg.drift_amp_open_min, cfg.drift_amp_open_max,
+        cfg.drift_freq_hz_min, cfg.drift_freq_hz_max, rng,
+        tau_amp_s=getattr(cfg, "tau_drift_amp_s", 0.0),
+        tau_freq_s=getattr(cfg, "tau_drift_freq_s", 0.0),
+    )
+    drift_closed = _make_quasi_drift(
+        t, cfg.drift_amp_closed_min, cfg.drift_amp_closed_max,
+        cfg.drift_freq_hz_min, cfg.drift_freq_hz_max, rng,
+        tau_amp_s=getattr(cfg, "tau_drift_amp_s", 0.0),
+        tau_freq_s=getattr(cfg, "tau_drift_freq_s", 0.0),
+    )
+
+    mech_open = mech_amp_open_t * np.sin(2 * np.pi * f_mech * t) \
+                + 0.3 * mech_amp_open_t * np.sin(2 * np.pi * (2 * f_mech) * t + 0.9)
+    mech_closed = mech_amp_closed_t * np.sin(2 * np.pi * f_mech * t) \
+                  + 0.3 * mech_amp_closed_t * np.sin(2 * np.pi * (2 * f_mech) * t + 0.9)
+
+    noise_open = rng.normal(0.0, 1.0, size=len(t)) * noise_rms_open_t
+    noise_closed = rng.normal(0.0, 1.0, size=len(t)) * noise_rms_closed_t
+
     t_open = cfg.t_set_N + drift_open + mech_open + noise_open
 
-    drift_closed = cfg.drift_amp_closed * np.sin(2 * np.pi * cfg.drift_freq_hz * t + 0.3)
-    mech_closed = cfg.mech_amp_closed * np.sin(2 * np.pi * f_mech * t) \
-                  + 0.3 * cfg.mech_amp_closed * np.sin(2 * np.pi * (2 * f_mech) * t + 0.9)
-    noise_closed = rng.normal(0.0, cfg.noise_rms_closed, size=len(t))
     residual = 0.02 * cfg.t_set_N * np.sin(2 * np.pi * (0.5 * f_mech) * t + 1.1)
     t_closed = cfg.t_set_N + drift_closed + mech_closed + noise_closed + residual
 
     return t_open, t_closed
 
 
-def _tensions_from_tavg_mu(tavg: np.ndarray, mu: np.ndarray, cfg: SimConfig, rng: np.random.Generator):
+def _tensions_from_tavg_mu(t: np.ndarray, tavg: np.ndarray, mu: np.ndarray, cfg: SimConfig, rng: np.random.Generator):
     """
     由 T_avg 与 μ 生成紧边/松边张力：
     r = exp(μθ)，且 (T_high+T_low)/2 = T_avg
@@ -518,8 +804,10 @@ def _tensions_from_tavg_mu(tavg: np.ndarray, mu: np.ndarray, cfg: SimConfig, rng
     t_high = 2.0 * tavg * r / (1.0 + r)
     t_low = 2.0 * tavg / (1.0 + r)
 
-    t_high = np.maximum(t_high + rng.normal(0.0, cfg.sensor_rms, size=len(t_high)), 0.0)
-    t_low = np.maximum(t_low + rng.normal(0.0, cfg.sensor_rms, size=len(t_low)), 0.0)
+    sensor_rms_t = _slow_bounded_series(t, cfg.sensor_rms_min, cfg.sensor_rms_max, getattr(cfg, "tau_sensor_s", 0.0), rng)
+
+    t_high = np.maximum(t_high + rng.normal(0.0, 1.0, size=len(t_high)) * sensor_rms_t, 0.0)
+    t_low = np.maximum(t_low + rng.normal(0.0, 1.0, size=len(t_low)) * sensor_rms_t, 0.0)
     return t_high, t_low
 
 
@@ -538,47 +826,26 @@ def _invert_mu_from_tensions(t_high: np.ndarray, t_low: np.ndarray, cfg: SimConf
 
 def _find_stable_baseline(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, cfg: SimConfig, end_idx: int = None):
     """
-    稳定段基线 μss：窗口内有效比例 + std + slope
+    稳定段基线 μss（按你的新规则）：
+    - 稳定窗口长度 W_ss -> N_ss 不变
+    - 窗口有效性条件不变（有效比例 + std + slope）
+    - 窗口滑动扫描逻辑不变（step=win//10）
+    - 先形成连续稳定窗口并集（stable segments），再用最短连续稳定段 Whold 过滤
+    - μss = 第一个“连续稳定段”（满足 Whold）的中位数（median），而非第一个稳定窗口
+    返回：((k_start, k_end), mu_ss)
     end_idx：仅在 [0,end_idx) 范围内判定（用于“超限后不再判定稳定段”）
     """
-    n_all = len(mu_f)
-    if n_all == 0:
+    segs = _find_stable_segments(mu_f, t, q_valid, cfg, end_idx=end_idx)
+    if not segs:
         return None, None
-    n = n_all if (end_idx is None) else int(max(0, min(n_all, end_idx)))
-    if n <= 0:
-        return None, None
-
-    win = int(round(cfg.stable_win_s * cfg.fs_Hz))
-    win = max(win, 50)
-    step = max(1, win // 10)
-
-    for k0 in range(0, n - win, step):
-        k1 = k0 + win
-        if q_valid[k0:k1].mean() < cfg.stable_valid_min:
-            continue
-        seg = mu_f[k0:k1]
-        seg = seg[np.isfinite(seg)]
-        if len(seg) < 10:
-            continue
-        if float(np.std(seg)) > cfg.stable_sigma_max:
-            continue
-
-        yy = mu_f[k0:k1]
-        tt = t[k0:k1]
+    k0, k1 = segs[0]
+    yy = mu_f[k0:k1]
+    qq = q_valid[k0:k1]
+    m = np.isfinite(yy) & (qq.astype(bool))
+    if int(m.sum()) < 5:
         m = np.isfinite(yy)
-        if m.sum() < 10:
-            continue
-        A = np.vstack([tt[m], np.ones(m.sum())]).T
-        slope = float(np.linalg.lstsq(A, yy[m], rcond=None)[0][0])
-        if abs(slope) > cfg.stable_slope_max:
-            continue
-
-        mu_ss = float(np.nanmean(yy[m]))
-        return (k0, k1), mu_ss
-
-    return None, None
-
-
+    mu_ss = float(np.nanmedian(yy[m])) if int(np.isfinite(yy[m]).sum()) > 0 else None
+    return (k0, k1), mu_ss
 def _find_stable_segments(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, cfg: SimConfig, end_idx: int = None) -> List[Tuple[int, int]]:
     """
     连续稳定段窗口识别（用于可视化）：
@@ -611,14 +878,23 @@ def _find_stable_segments(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, 
         if float(np.std(seg)) > cfg.stable_sigma_max:
             continue
 
+        # 总漂移量判据（替代斜率判据）：
+        # 取窗口前/后 10% 样本的中位数差值作为漂移量 Δμ，并与阈值比较（Δμ_max=stable_slope_max）
         yy = mu_f[k0:k1]
-        tt = t[k0:k1]
-        mm = np.isfinite(yy)
+        vv = q_valid[k0:k1].astype(bool)
+        mm = np.isfinite(yy) & vv
+        if mm.sum() < 10:
+            mm = np.isfinite(yy)
         if mm.sum() < 10:
             continue
-        A = np.vstack([tt[mm], np.ones(mm.sum())]).T
-        slope = float(np.linalg.lstsq(A, yy[mm], rcond=None)[0][0])
-        if abs(slope) > cfg.stable_slope_max:
+        vals = yy[mm]
+        nvals = int(len(vals))
+        edge = max(5, int(round(0.10 * nvals)))
+        edge = min(edge, max(5, nvals // 2))
+        head = np.nanmedian(vals[:edge])
+        tail = np.nanmedian(vals[-edge:])
+        drift = float(abs(tail - head))
+        if drift > cfg.stable_slope_max:
             continue
 
         stable_mask[k0:k1] = True
@@ -634,11 +910,20 @@ def _find_stable_segments(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, 
             i = j
         else:
             i += 1
+    # 依据 Whold 过滤：连续稳定窗口并集覆盖时间不足者不计为稳定段
+    min_hold_s = float(getattr(cfg, 'stable_hold_s', 0.0))
+    if min_hold_s > 0.0:
+        segs2: List[Tuple[int, int]] = []
+        for a, b in segs:
+            dur_s = float(max(0.0, (b - a) / max(1e-9, cfg.fs_Hz)))
+            if dur_s + 1e-9 >= min_hold_s:
+                segs2.append((a, b))
+        segs = segs2
     return segs
 
 
 def _find_failure_time(mu_f: np.ndarray, t: np.ndarray, mu_ss: Optional[float], cfg: SimConfig, start_idx: int = 0):
-    """寿命判据：μ 持续超过 μth=μss*(1+δ) 持续 W_hold，输出 tlife"""
+    """寿命判据：μ 持续超过 μth=μss*(1+δ) 持续 Wpersist，输出 tlife"""
     if mu_ss is None or not np.isfinite(mu_ss):
         return None, None
     mu_th = float(mu_ss * (1.0 + cfg.fail_delta))
@@ -680,8 +965,8 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     tavg_open, tavg_closed = _make_tavg_open_closed(t, cfg, rng)
 
     _cb(progress_cb, 24.0, "生成高/低张力侧张力（含传感器噪声）...")
-    th_open, tl_open = _tensions_from_tavg_mu(tavg_open, mu_true, cfg, rng)
-    th_cl, tl_cl = _tensions_from_tavg_mu(tavg_closed, mu_true, cfg, rng)
+    th_open, tl_open = _tensions_from_tavg_mu(t, tavg_open, mu_true, cfg, rng)
+    th_cl, tl_cl = _tensions_from_tavg_mu(t, tavg_closed, mu_true, cfg, rng)
 
     ff_open = th_open - tl_open
     ff_cl = th_cl - tl_cl
@@ -834,11 +1119,32 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
         "t_set_N": np.full_like(t_e, float(cfg.t_set_N), dtype=float),
     })
 
+    
+    # 开环-闭环对比输出范围数据表（可选）
+    t0_cmp = float(getattr(cfg, "compare_t_start_s", 0.0))
+    t1_cmp = float(getattr(cfg, "compare_t_end_s", -1.0))
+    if (t0_cmp == 0.0) and (t1_cmp < 0.0):
+        cmp_mask = np.ones_like(t_e, dtype=bool)
+    else:
+        if t1_cmp < 0.0:
+            t1_cmp = float(t_e[-1])
+        t0_cmp = max(0.0, t0_cmp)
+        t1_cmp = max(t0_cmp, t1_cmp)
+        cmp_mask = (t_e >= t0_cmp) & (t_e <= t1_cmp)
+        if int(cmp_mask.sum()) < 2:
+            cmp_mask = np.ones_like(t_e, dtype=bool)
+
+    compare_df = pd.DataFrame({
+        "t_s": t_e[cmp_mask],
+        "t_avg_open_N": ds(op["tavg"])[cmp_mask],
+        "t_avg_closed_N": ds(cl["tavg"])[cmp_mask],
+    })
+
     xlsx_path = os.path.join(out_dir, "needle_hook_wear_sim.xlsx")
     _cb(progress_cb, 55.0, "开始写入 xlsx（多sheet，必要时自动拆分）...")
     _write_xlsx_multisheet(
         xlsx_path,
-        {"closed_loop": closed_df, "open_loop": open_df},
+        {"closed_loop": closed_df, "open_loop": open_df, "compare_window": compare_df},
         progress_cb=progress_cb,
         base_pct=55.0,
         span_pct=44.0
@@ -999,8 +1305,31 @@ def export_plots(res: Dict[str, Any], out_dir: str, lang: str = "zh", progress_c
 
     # 3) 开环 vs 闭环平均张力
     _cb(progress_cb, 90.0, "绘图：开环 vs 闭环平均张力...")
-    tx, o = _downsample_for_plot(t, op["tavg"], cfg.plot_max_points)
-    _, c = _downsample_for_plot(t, cl["tavg"], cfg.plot_max_points)
+
+    # 对比输出范围：支持设置 [t_start, t_end]，(0,-1) 表示全部
+    t0_cmp = float(getattr(cfg, "compare_t_start_s", 0.0))
+    t1_cmp = float(getattr(cfg, "compare_t_end_s", -1.0))
+    if (t0_cmp == 0.0) and (t1_cmp < 0.0):
+        t_cmp = t
+        op_cmp = op["tavg"]
+        cl_cmp = cl["tavg"]
+    else:
+        if t1_cmp < 0.0:
+            t1_cmp = float(t[-1])
+        t0_cmp = max(0.0, t0_cmp)
+        t1_cmp = max(t0_cmp, t1_cmp)
+        mask = (t >= t0_cmp) & (t <= t1_cmp)
+        if int(mask.sum()) < 2:
+            t_cmp = t
+            op_cmp = op["tavg"]
+            cl_cmp = cl["tavg"]
+        else:
+            t_cmp = t[mask]
+            op_cmp = op["tavg"][mask]
+            cl_cmp = cl["tavg"][mask]
+
+    tx, o = _downsample_for_plot(t_cmp, op_cmp, cfg.plot_max_points)
+    _, c = _downsample_for_plot(t_cmp, cl_cmp, cfg.plot_max_points)
     plt.figure()
     plt.plot(tx, o, label=L["open"], color="tab:orange")
     plt.plot(tx, c, label=L["closed"], color="tab:blue")
@@ -1089,3 +1418,14 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
+
+    # 阶段过渡速度系数（用于调整“段间过渡速度”，保证连续）
+    # - 磨合→稳定：系数越大，衰减越快（过渡越快）
+    # - 稳定→加速：系数越大，S 形上升越陡（过渡越快）
+    trans_runin2stable_k: float = 1.0
+    trans_stable2severe_k: float = 1.0
+
+    # 开环-闭环对比输出范围（单位：s）
+    # - (0, -1) 表示全部输出（默认）
+    compare_t_start_s: float = 0.0
+    compare_t_end_s: float = -1.0
