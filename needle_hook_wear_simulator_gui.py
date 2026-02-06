@@ -220,12 +220,62 @@ def _write_xlsx_multisheet(
     total_rows = sum(len(df) for df in frames.values())
     total_rows = max(1, total_rows)
     written = 0
+    total_cells = int(sum(int(df.shape[0]) * int(df.shape[1]) for df in frames.values()))
+
+    # 小规模数据按列写更快；大规模数据使用常量内存按行写更稳
+    max_cells_for_column = 5_000_000
+    use_column_write = total_cells <= max_cells_for_column
+
+    def _cell_len(v) -> int:
+        if v is None:
+            return 0
+        try:
+            if isinstance(v, float) and not np.isfinite(v):
+                return 0
+        except Exception:
+            pass
+        return len(str(v))
+
+    def _normalize_value(v):
+        if v is None:
+            return None
+        try:
+            if isinstance(v, float) and not np.isfinite(v):
+                return None
+        except Exception:
+            pass
+        return v
+
+    def _normalize_row(row):
+        return [_normalize_value(v) for v in row]
+
+    def _normalize_column(data):
+        if not data:
+            return data
+        try:
+            arr = np.asarray(data, dtype=float)
+            if np.isfinite(arr).all():
+                return data
+        except Exception:
+            pass
+        return [_normalize_value(v) for v in data]
+
+    def _col_width(col_name: str, sample_vals: List[Any]) -> float:
+        max_len = _cell_len(col_name)
+        for v in sample_vals:
+            max_len = max(max_len, _cell_len(v))
+        # 适度留白，限制最大宽度，避免异常值导致过宽
+        width = max(8, min(40, max_len + 2))
+        return float(width)
 
     def _p(msg: str):
         pct = base_pct + span_pct * (written / total_rows)
         _cb(progress_cb, min(99.0, pct), msg)
 
-    wb = xlsxwriter.Workbook(xlsx_path, {"constant_memory": True})
+    wb = xlsxwriter.Workbook(
+        xlsx_path,
+        {"constant_memory": not use_column_write, "nan_inf_to_errors": True},
+    )
     try:
         for name, df in frames.items():
             n = len(df)
@@ -246,10 +296,25 @@ def _write_xlsx_multisheet(
                 # 表头
                 ws.write_row(0, 0, cols)
 
-                # 按列写入（通常比逐行逐单元格更快）
+                if use_column_write:
+                    # 按列写入（速度快，但会占用更多内存）
+                    for c, col in enumerate(cols):
+                        data = _normalize_column(part_df[col].tolist())
+                        ws.write_column(1, c, data)
+                else:
+                    # 常量内存模式下必须按行写入，否则会被丢弃
+                    row_idx = 1
+                    for row in part_df.itertuples(index=False, name=None):
+                        ws.write_row(row_idx, 0, _normalize_row(row))
+                        row_idx += 1
+
+                # 根据前两行（表头 + 前两条数据）自动调整列宽
+                sample_df = part_df.head(2)
                 for c, col in enumerate(cols):
-                    data = part_df[col].tolist()
-                    ws.write_column(1, c, data)
+                    sample_vals = []
+                    if not sample_df.empty:
+                        sample_vals = sample_df[col].tolist()
+                    ws.set_column(c, c, _col_width(col, sample_vals))
 
                 written += len(part_df)
                 _p(f"写入 xlsx：{sheet}（{written}/{total_rows} 行）")
