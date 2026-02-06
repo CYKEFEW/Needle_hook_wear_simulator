@@ -62,7 +62,7 @@ def _notch_q_from_rpm(rpm: float) -> float:
     return float(max(15.0, min(80.0, rpm / 10.0)))
 
 
-def _setup_chinese_font(cb: ProgressCB = None) -> Dict[str, Any]:
+def _setup_chinese_font(cb: ProgressCB = None, pct: float = 2.0) -> Dict[str, Any]:
     """尝试设置 matplotlib 中文字体，避免导出图片中文乱码"""
     candidates = [
         "Microsoft YaHei", "微软雅黑",
@@ -83,11 +83,19 @@ def _setup_chinese_font(cb: ProgressCB = None) -> Dict[str, Any]:
     matplotlib.rcParams["axes.unicode_minus"] = False
     if chosen:
         matplotlib.rcParams["font.sans-serif"] = [chosen]
-        _cb(cb, 2.0, f"已设置绘图中文字体：{chosen}")
+        _cb(cb, pct, f"已设置绘图中文字体：{chosen}")
         return {"font_ok": True, "font_name": chosen}
 
-    _cb(cb, 2.0, "未检测到常见中文字体：中文图可能仍会乱码（可安装微软雅黑/黑体/Noto Sans CJK等）")
+    _cb(cb, pct, "未检测到常见中文字体：中文图可能仍会乱码（可安装微软雅黑/黑体/Noto Sans CJK等）")
     return {"font_ok": False, "font_name": None}
+
+
+def setup_plot_font(lang: str = "zh", progress_cb: ProgressCB = None, pct: float = 2.0) -> Dict[str, Any]:
+    """按语言准备绘图字体（用于 GUI 预处理或导出阶段）"""
+    if str(lang).lower().startswith("zh"):
+        return _setup_chinese_font(progress_cb, pct=pct)
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return {"font_ok": True, "font_name": None}
 
 
 def _downsample_for_plot(x: np.ndarray, y: np.ndarray, max_points: int = 200_000):
@@ -291,8 +299,8 @@ class SimConfig:
     # 阶段过渡速度系数（用于调整“段间过渡速度”，保证连续）
     # - 磨合→稳定：系数越大，衰减越快（过渡越快）
     # - 稳定→加速：系数越大，S 形上升越陡（过渡越快）
-    trans_runin2stable_k: float = 1.0
-    trans_stable2severe_k: float = 1.0
+    trans_runin2stable_k: float = 2.0
+    trans_stable2severe_k: float = 5.0
 
     # 开环-闭环对比输出范围（单位：s）
     # - (0, -1) 表示全部输出（默认）
@@ -343,10 +351,10 @@ class SimConfig:
     # - <=0 表示不启用慢变：仍按“每次仿真从范围内抽一次常量”的旧逻辑（兼容）
     # - 建议：机械周期扰动/噪声RMS 的 τ 取 300~3000s；漂移相关 τ 取 1800~20000s
     tau_mech_s: float = 1200.0
-    tau_noise_s: float = 900.0
-    tau_sensor_s: float = 900.0
-    tau_drift_amp_s: float = 7200.0
-    tau_drift_freq_s: float = 7200.0
+    tau_noise_s: float = 300.0
+    tau_sensor_s: float = 300.0
+    tau_drift_amp_s: float = 900.0
+    tau_drift_freq_s: float = 4800.0
 
     # 门控/裁剪（抑制“比值+对数”放大）
     tmin_gate_N: float = 0.08
@@ -359,20 +367,20 @@ class SimConfig:
     lowpass_fc_hz: float = 2.5
 
     # 稳定段/寿命判据
-    stable_win_s: float = 300.0
+    stable_win_s: float = 1200.0
     # 最短连续稳定段时长 Whold（s）：用于判定“连续稳定段”是否成立
     # - 若连续稳定窗口并集覆盖时间 < Whold，则该段不计为稳定段，也不用于 μss 计算
-    stable_hold_s: float = 3600.0
+    stable_hold_s: float = 7200.0
 
-    stable_sigma_max: float = 0.05  # 默认 0.05
+    stable_sigma_max: float = 0.03  # 默认 0.03
     stable_slope_max: float = 0.015  # Δμ_max：稳定窗口内允许的最大总漂移量（默认按 Wss=300s 约等效 5e-5/s）
     stable_valid_min: float = 0.9
     fail_delta: float = 0.25
-    fail_hold_s: float = 60.0
+    fail_hold_s: float = 300.0
 
     # 导出/绘图
     export_stride: int = 1
-    plot_max_points: int = 200_000
+    plot_max_points: int = 2_000_000
 
     def validate(self) -> None:
         assert self.fs_Hz > 0
@@ -1158,7 +1166,13 @@ def _legend_below_center(ncol: int = 3):
     plt.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=ncol, frameon=False)
 
 
-def export_plots(res: Dict[str, Any], out_dir: str, lang: str = "zh", progress_cb: ProgressCB = None) -> Dict[str, str]:
+def export_plots(
+    res: Dict[str, Any],
+    out_dir: str,
+    lang: str = "zh",
+    progress_cb: ProgressCB = None,
+    font_prepared: bool = False,
+) -> Dict[str, str]:
     """
     导出图片：
     - lang: "zh" 或 "en"
@@ -1171,11 +1185,8 @@ def export_plots(res: Dict[str, Any], out_dir: str, lang: str = "zh", progress_c
     plot_dir = os.path.join(out_dir, "plots")
     _ensure_dir(plot_dir)
 
-    if lang.lower().startswith("zh"):
-        _cb(progress_cb, 52.0, "设置中文绘图字体...")
-        _setup_chinese_font(progress_cb)
-    else:
-        matplotlib.rcParams["axes.unicode_minus"] = False
+    if not font_prepared:
+        setup_plot_font(lang=lang, progress_cb=progress_cb, pct=52.0)
 
     t = res["series"]["t"]
     cl = res["series"]["closed"]

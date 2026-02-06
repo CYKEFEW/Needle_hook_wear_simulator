@@ -20,7 +20,15 @@ import queue
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from needle_hook_wear_simulator_gui import SimConfig, simulate, export_xlsx, export_plots, export_summary, HAVE_SCIPY
+from needle_hook_wear_simulator_gui import (
+    SimConfig,
+    simulate,
+    export_xlsx,
+    export_plots,
+    export_summary,
+    setup_plot_font,
+    HAVE_SCIPY,
+)
 
 
 class App(tk.Tk):
@@ -34,7 +42,7 @@ class App(tk.Tk):
         self.worker = None
         self._ini_path = Path(__file__).resolve().parent / "defaultData.ini"
 
-        self.cfg = SimConfig()  # 默认包角20°，默认rpm=300
+        self.cfg = SimConfig()  # 默认包角100°，默认rpm=300
         self.out_dir = tk.StringVar(value=os.path.abspath("sim_out"))
         self.seed = tk.IntVar(value=7)
 
@@ -51,7 +59,7 @@ class App(tk.Tk):
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
         info = ("说明：fs 与采样时间仅用于生成时间轴（输出点数）。\n"
-                "机械主频：仅由 rpm 换算 f_mech=rpm/60*m（默认300rpm）。\n"
+                "机械主频：仅由 rpm 换算 f_mech=rpm/60*m。\n"
                 "陷波 Q：根据 rpm 自动估算（Q≈clamp(15,80,rpm/10)）。\n"
                 "μ-时间图：含稳定段基线 μss、超限阈值 μth，显示连续稳定段（并集），标注 tlife（仅图例显示数值）。\n"
                 "规则：第一次超限后不再判定稳定段窗口。\n"
@@ -101,7 +109,7 @@ class App(tk.Tk):
         self._types = {}
 
         # 核心输入
-        self._add_entry(tab_core, "包角 θ (deg)（默认100）", "theta_deg")
+        self._add_entry(tab_core, "包角 θ (deg)", "theta_deg")
         self._add_entry(tab_core, "平均张力设定 T_set (N)", "t_set_N")
         self._add_entry(tab_core, "采样率 fs (Hz) 仅生成时间轴", "fs_Hz")
         self._add_entry(tab_core, "采样时间 duration (h) 仅生成时间轴", "duration_h")
@@ -185,7 +193,7 @@ class App(tk.Tk):
 
         # 扰动：只允许 rpm 输入主频（删除直接输入主频）
         ttk.Label(tab_dist, text="机械周期扰动主频：f_mech = rpm/60*m（仅此方式输入）").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        self._add_entry(tab_dist, "转速 rpm（默认300）", "rpm", row=1)
+        self._add_entry(tab_dist, "转速 rpm", "rpm", row=1)
         self._add_entry(tab_dist, "倍频 m（1=一次转频）", "mech_harmonic", row=2, is_int=True)
 
         self._add_range_entry(tab_dist, "开环周期幅值 A_mech_open (N)", "mech_amp_open_min", "mech_amp_open_max", row=3)
@@ -224,8 +232,8 @@ class App(tk.Tk):
         # 判据
         ttk.Label(tab_judge, text="稳定段基线：std + slope + 有效比例；寿命：阈值线持续超限（第一次超限后不再判定稳定段）").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self._add_entry(tab_judge, "稳定窗口 W_ss (s)", "stable_win_s", row=1)
-        self._add_entry(tab_judge, "最短连续稳定段 Whold (s)（默认3600）", "stable_hold_s", row=2)
-        self._add_entry(tab_judge, "稳定标准差 σ_max（默认0.05）", "stable_sigma_max", row=3)
+        self._add_entry(tab_judge, "最短连续稳定段 Whold (s)", "stable_hold_s", row=2)
+        self._add_entry(tab_judge, "稳定标准差 σ_max", "stable_sigma_max", row=3)
         self._add_entry(tab_judge, "稳定总漂移阈值 Δμ_max", "stable_slope_max", row=4)
         self._add_entry(tab_judge, "稳定有效比例 q_min", "stable_valid_min", row=5)
         self._add_entry(tab_judge, "失效阈值增量 δ（μth=μss*(1+δ)）", "fail_delta", row=6)
@@ -942,13 +950,14 @@ class App(tk.Tk):
         return hashlib.md5(s.encode("utf-8")).hexdigest()
 
 
-    def _ensure_simulated(self, progress_cb):
+    def _ensure_simulated(self, progress_cb, prepare_plot: bool = False):
+        progress_cb(1.0, "开始生成仿真数据（用于导出）...")
+        if prepare_plot:
+            setup_plot_font(lang=self.plot_lang.get(), progress_cb=progress_cb, pct=2.0)
         key = self._make_cache_key()
         if self._cache_res is not None and self._cache_key == key:
             progress_cb(10.0, "参数未变，使用缓存的仿真结果（跳过重算）")
             return self._cache_res
-
-        progress_cb(1.0, "开始生成仿真数据（用于导出）...")
         res = simulate(self.cfg, seed=int(self.seed.get()), progress_cb=progress_cb)
         self._cache_key = key
         self._cache_res = res
@@ -987,12 +996,18 @@ class App(tk.Tk):
 
         def work():
             try:
-                res = self._ensure_simulated(progress_cb)
+                res = self._ensure_simulated(progress_cb, prepare_plot=(task == "plots"))
                 outputs = {}
                 if task == "xlsx":
                     outputs["xlsx"] = export_xlsx(res, out_dir=out_dir, progress_cb=progress_cb)
                 elif task == "plots":
-                    outputs.update(export_plots(res, out_dir=out_dir, lang=self.plot_lang.get(), progress_cb=progress_cb))
+                    outputs.update(export_plots(
+                        res,
+                        out_dir=out_dir,
+                        lang=self.plot_lang.get(),
+                        progress_cb=progress_cb,
+                        font_prepared=True,
+                    ))
                 export_summary(res, out_dir=out_dir, extra={"outputs": outputs})
                 self.msg_q.put(("done", task))
             except Exception as e:
