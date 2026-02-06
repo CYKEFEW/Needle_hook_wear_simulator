@@ -3,3 +3,5 @@ needle_hook_wear_sim_package.zip
 sim_out/
 .venv/
 __pycache__/
+dist/
+build/

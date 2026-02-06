@@ -33,6 +33,7 @@ exe = EXE(
     a.datas,
     name="needle_hook_wear_sim",
     console=False,
+    icon="app.ico",
 )
 
 coll = COLLECT(

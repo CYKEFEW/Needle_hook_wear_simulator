@@ -35,6 +35,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("针钩磨损检测全过程仿真（Capstan + 扰动 + 滤波 + 判据）")
+        # 设置窗口左上角图标（Windows）
+        try:
+            icon_path = Path(__file__).resolve().parent / "app.ico"
+            if icon_path.exists():
+                self.iconbitmap(str(icon_path))
+        except Exception:
+            pass
         self.geometry("1080x760")
         self.minsize(980, 700)
 
