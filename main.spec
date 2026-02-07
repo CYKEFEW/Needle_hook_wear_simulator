@@ -10,6 +10,8 @@ datas += [("app.ico", ".")]
 
 hiddenimports = []
 hiddenimports += collect_submodules("matplotlib")
+hiddenimports += collect_submodules("xlsxwriter")
+hiddenimports += collect_submodules("openpyxl")
 
 a = Analysis(
     ["needle_hook_wear_sim_gui_app.py"],
