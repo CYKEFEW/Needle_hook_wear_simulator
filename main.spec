@@ -6,7 +6,6 @@ block_cipher = None
 
 datas = []
 datas += collect_data_files("matplotlib")
-datas += [("defaultData.ini", ".")]
 datas += [("app.ico", ".")]
 
 hiddenimports = []

@@ -5,3 +5,4 @@ sim_out/
 __pycache__/
 dist/
 build/
+defaultData.ini

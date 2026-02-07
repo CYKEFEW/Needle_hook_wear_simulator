@@ -61,6 +61,14 @@ def _notch_q_from_rpm(rpm: float) -> float:
         rpm = 300.0
     return float(max(15.0, min(80.0, rpm / 10.0)))
 
+def _notch_q_from_rpm_vec(rpm_t: np.ndarray) -> np.ndarray:
+    """向量化计算陷波 Q（与 rpm 对齐）"""
+    arr = np.asarray(rpm_t, dtype=float)
+    q = arr / 10.0
+    q = np.clip(q, 15.0, 80.0)
+    q[~np.isfinite(arr)] = 15.0
+    return q.astype(float)
+
 
 def _setup_chinese_font(cb: ProgressCB = None, pct: float = 2.0) -> Dict[str, Any]:
     """尝试设置 matplotlib 中文字体，避免导出图片中文乱码"""
@@ -132,25 +140,101 @@ def _hampel_filter_nan(x: np.ndarray, win: int, n_sigmas: float = 3.0) -> np.nda
     return y.to_numpy()
 
 
-def _iir_notch(x: np.ndarray, fs: float, f0: float, q: float) -> np.ndarray:
-    """陷波滤波：优先 SciPy iirnotch，否则频域窄带抑制（全局）"""
+def _notch_freq_domain(x: np.ndarray, fs: float, f0: float, q: float) -> np.ndarray:
+    """无 SciPy：频域抑制（用于仿真展示足够）"""
     if f0 <= 0 or f0 >= fs / 2:
         return x.copy()
-
-    if HAVE_SCIPY:
-        b, a = signal.iirnotch(w0=f0, Q=q, fs=fs)
-        try:
-            return signal.filtfilt(b, a, x, method="gust")
-        except Exception:
-            return signal.filtfilt(b, a, x)
-
-    # 无 SciPy：频域抑制（用于仿真展示足够）
     X = np.fft.rfft(x)
     freqs = np.fft.rfftfreq(len(x), d=1.0 / fs)
     bw = max(0.05, f0 / max(1.0, q))
     mask = (freqs > (f0 - bw)) & (freqs < (f0 + bw))
     X[mask] = 0
     return np.fft.irfft(X, n=len(x))
+
+
+def _iir_notch_time_varying(
+    x: np.ndarray,
+    fs: float,
+    f0_t: np.ndarray,
+    q_t: np.ndarray,
+    block_s: float = 10.0,
+) -> np.ndarray:
+    """随时间变化的陷波：分块 + 重叠加权近似"""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n == 0:
+        return x.copy()
+
+    f0_t = np.asarray(f0_t, dtype=float)
+    q_t = np.asarray(q_t, dtype=float)
+    if len(f0_t) != n:
+        f0_t = np.full(n, float(np.nanmedian(f0_t)) if len(f0_t) > 0 else 0.0)
+    if len(q_t) != n:
+        q_t = np.full(n, float(np.nanmedian(q_t)) if len(q_t) > 0 else 15.0)
+
+    block = int(max(32, round(block_s * fs)))
+    block = min(block, n)
+    hop = max(1, block // 2)
+
+    out = np.zeros_like(x)
+    weight = np.zeros_like(x)
+
+    for start in range(0, n, hop):
+        end = min(n, start + block)
+        seg = x[start:end]
+        f_seg = f0_t[start:end]
+        q_seg = q_t[start:end]
+        m = np.isfinite(f_seg) & np.isfinite(q_seg)
+        if not np.any(m):
+            seg_f = seg
+        else:
+            f0 = float(np.median(f_seg[m]))
+            qv = float(np.median(q_seg[m]))
+            if f0 <= 0 or f0 >= fs / 2:
+                seg_f = seg
+            else:
+                if HAVE_SCIPY:
+                    b, a = signal.iirnotch(w0=f0, Q=qv, fs=fs)
+                    try:
+                        seg_f = signal.filtfilt(b, a, seg, method="gust")
+                    except Exception:
+                        try:
+                            seg_f = signal.filtfilt(b, a, seg)
+                        except Exception:
+                            seg_f = signal.lfilter(b, a, seg)
+                else:
+                    seg_f = _notch_freq_domain(seg, fs, f0, qv)
+
+        L = end - start
+        if L <= 1:
+            w = np.ones(L, dtype=float)
+        else:
+            w = np.hanning(L).astype(float)
+        out[start:end] += seg_f * w
+        weight[start:end] += w
+
+    y = x.copy()
+    m = weight > 1e-12
+    y[m] = out[m] / weight[m]
+    return y
+
+
+def _iir_notch(x: np.ndarray, fs: float, f0: float | np.ndarray, q: float | np.ndarray, block_s: float = 10.0) -> np.ndarray:
+    """陷波滤波：支持 f0/Q 随时间变化"""
+    if np.ndim(f0) == 0 and np.ndim(q) == 0:
+        f0 = float(f0)
+        q = float(q)
+        if f0 <= 0 or f0 >= fs / 2:
+            return x.copy()
+        if HAVE_SCIPY:
+            b, a = signal.iirnotch(w0=f0, Q=q, fs=fs)
+            try:
+                return signal.filtfilt(b, a, x, method="gust")
+            except Exception:
+                return signal.filtfilt(b, a, x)
+        return _notch_freq_domain(x, fs, f0, q)
+
+    return _iir_notch_time_varying(x, fs, np.asarray(f0), np.asarray(q), block_s=block_s)
 
 
 def _lowpass(x: np.ndarray, fs: float, fc: float, order: int = 3) -> np.ndarray:
@@ -332,7 +416,11 @@ class SimConfig:
     duration_s: float = 36000.0
 
     # 机械扰动：仅由 rpm 换算
+    # 兼容字段：rpm（固定值），推荐用 rpm_min/rpm_max + tau_rpm_s 做慢变
     rpm: float = 300.0
+    rpm_min: float = 285.0
+    rpm_max: float = 315.0
+    tau_rpm_s: float = 1200.0
     mech_harmonic: int = 1
 
     # 扰动（开环明显，闭环衰减）
@@ -453,7 +541,31 @@ class SimConfig:
         assert self.export_stride >= 1
         assert 0 < self.theta_deg < 1080
         assert self.mech_harmonic >= 1
-        assert self.rpm > 0, "rpm 必须>0（仅使用转速输入机械主频）"
+        # rpm 范围合法性
+        try:
+            rmin = float(getattr(self, "rpm_min", self.rpm))
+            rmax = float(getattr(self, "rpm_max", self.rpm))
+        except Exception:
+            rmin = float(self.rpm)
+            rmax = float(self.rpm)
+        if rmin <= 0 or rmax <= 0:
+            raise ValueError("rpm 必须>0（仅使用转速输入机械主频）")
+        if rmin > rmax:
+            rmin, rmax = rmax, rmin
+        # 若 rpm_min/max 仍是默认值且 rpm 不同，则以 rpm 为准（兼容旧用法）
+        try:
+            rpm_val = float(self.rpm)
+            if abs(rmin - rmax) < 1e-12 and abs(rmin - 300.0) < 1e-9 and abs(rpm_val - 300.0) > 1e-9:
+                rmin = rpm_val
+                rmax = rpm_val
+        except Exception:
+            pass
+        self.rpm_min = float(rmin)
+        self.rpm_max = float(rmax)
+        # 同步 rpm 为当前范围中值（便于兼容旧逻辑）
+        self.rpm = float(0.5 * (rmin + rmax))
+        # 转速慢变时间常数
+        self.tau_rpm_s = float(max(0.0, getattr(self, "tau_rpm_s", 0.0)))
 
         # 阶段比例归一化
         r1 = max(0.0, float(self.phase_runin_ratio))
@@ -563,7 +675,7 @@ class SimConfig:
             self.mu_severe_max = self.mu_stable_max
 
         # 慢变时间常数：>=0（<=0 表示关闭慢变，保持旧逻辑）
-        for _k in ["tau_mech_s", "tau_noise_s", "tau_sensor_s", "tau_drift_amp_s", "tau_drift_freq_s"]:
+        for _k in ["tau_rpm_s", "tau_mech_s", "tau_noise_s", "tau_sensor_s", "tau_drift_amp_s", "tau_drift_freq_s"]:
             if hasattr(self, _k):
                 try:
                     v = float(getattr(self, _k))
@@ -574,13 +686,26 @@ class SimConfig:
                 setattr(self, _k, max(0.0, v))
 
 
+    def rpm_range(self) -> Tuple[float, float]:
+        """转速范围（rpm）"""
+        rmin = float(getattr(self, "rpm_min", self.rpm))
+        rmax = float(getattr(self, "rpm_max", self.rpm))
+        if rmin > rmax:
+            rmin, rmax = rmax, rmin
+        return float(rmin), float(rmax)
+
+    def rpm_used(self) -> float:
+        """当前用于派生计算的转速（rpm）"""
+        rmin, rmax = self.rpm_range()
+        return float(0.5 * (rmin + rmax))
+
     def mech_freq(self) -> float:
         """机械主频（Hz）"""
-        return (float(self.rpm) / 60.0) * float(self.mech_harmonic)
+        return (float(self.rpm_used()) / 60.0) * float(self.mech_harmonic)
 
     def notch_q_used(self) -> float:
         """陷波 Q（自动）"""
-        return _notch_q_from_rpm(self.rpm)
+        return _notch_q_from_rpm(self.rpm_used())
 
 
 def _pick_mu_anchors(cfg: SimConfig, rng: np.random.Generator):
@@ -818,7 +943,10 @@ def _make_tavg_open_closed(t: np.ndarray, cfg: SimConfig, rng: np.random.Generat
       支持在给定范围内“随时间慢变”（更贴近真实准周期/工况漂移）。
     - 慢变速度由 cfg.tau_*_s 控制；tau<=0 时自动退化为旧逻辑（整段抽一次常量）。
     """
-    f_mech = cfg.mech_freq()
+    # 转速慢变：rpm(t) -> f_mech(t)
+    rpm_min, rpm_max = cfg.rpm_range()
+    rpm_t = _slow_bounded_series(t, rpm_min, rpm_max, getattr(cfg, "tau_rpm_s", 0.0), rng, sigma_z=0.25)
+    f_mech_t = (rpm_t / 60.0) * float(max(1, cfg.mech_harmonic))
 
     # 机械周期扰动幅值（慢变）
     mech_amp_open_t = _slow_bounded_series(
@@ -850,20 +978,32 @@ def _make_tavg_open_closed(t: np.ndarray, cfg: SimConfig, rng: np.random.Generat
         tau_freq_s=getattr(cfg, "tau_drift_freq_s", 0.0),
     )
 
-    mech_open = mech_amp_open_t * np.sin(2 * np.pi * f_mech * t) \
-                + 0.3 * mech_amp_open_t * np.sin(2 * np.pi * (2 * f_mech) * t + 0.9)
-    mech_closed = mech_amp_closed_t * np.sin(2 * np.pi * f_mech * t) \
-                  + 0.3 * mech_amp_closed_t * np.sin(2 * np.pi * (2 * f_mech) * t + 0.9)
+    # 频率随时间变化时，用相位累积生成准周期信号
+    if len(t) >= 2:
+        dt = float(np.median(np.diff(t)))
+    else:
+        dt = 1.0
+    dt = max(dt, 1e-6)
+    p1 = float(rng.uniform(0.0, 2.0 * np.pi))
+    p2 = float(rng.uniform(0.0, 2.0 * np.pi))
+    phi1 = 2.0 * np.pi * np.cumsum(f_mech_t) * dt + p1
+    phi2 = 2.0 * np.pi * np.cumsum(2.0 * f_mech_t) * dt + p2
+
+    mech_open = mech_amp_open_t * np.sin(phi1) \
+                + 0.3 * mech_amp_open_t * np.sin(phi2 + 0.9)
+    mech_closed = mech_amp_closed_t * np.sin(phi1) \
+                  + 0.3 * mech_amp_closed_t * np.sin(phi2 + 0.9)
 
     noise_open = rng.normal(0.0, 1.0, size=len(t)) * noise_rms_open_t
     noise_closed = rng.normal(0.0, 1.0, size=len(t)) * noise_rms_closed_t
 
     t_open = cfg.t_set_N + drift_open + mech_open + noise_open
 
-    residual = 0.02 * cfg.t_set_N * np.sin(2 * np.pi * (0.5 * f_mech) * t + 1.1)
+    phi_res = 2.0 * np.pi * np.cumsum(0.5 * f_mech_t) * dt + 1.1
+    residual = 0.02 * cfg.t_set_N * np.sin(phi_res)
     t_closed = cfg.t_set_N + drift_closed + mech_closed + noise_closed + residual
 
-    return t_open, t_closed
+    return t_open, t_closed, rpm_t, f_mech_t
 
 
 def _tensions_from_tavg_mu(t: np.ndarray, tavg: np.ndarray, mu: np.ndarray, cfg: SimConfig, rng: np.random.Generator):
@@ -1035,7 +1175,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     mu_true = _mu_profile(t, cfg, mu_runin_start_used, mu_stable_used, mu_severe_end_used)
 
     _cb(progress_cb, 18.0, "生成开环/闭环平均张力...")
-    tavg_open, tavg_closed = _make_tavg_open_closed(t, cfg, rng)
+    tavg_open, tavg_closed, rpm_t, f_mech_t = _make_tavg_open_closed(t, cfg, rng)
 
     _cb(progress_cb, 24.0, "生成高/低张力侧张力（含传感器噪声）...")
     th_open, tl_open = _tensions_from_tavg_mu(t, tavg_open, mu_true, cfg, rng)
@@ -1056,10 +1196,25 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     fill = np.nanmedian(mu_cl_h[np.isfinite(mu_cl_h)]) if np.any(np.isfinite(mu_cl_h)) else 0.0
     mu_f0 = np.nan_to_num(mu_cl_h, nan=fill)
 
-    f_mech = cfg.mech_freq()
-    q_notch = cfg.notch_q_used()
-    _cb(progress_cb, 40.0, f"μ 陷波（f_mech={f_mech:.6g}Hz, Q={q_notch:.3g}）...")
-    mu_cl_notch = _iir_notch(mu_f0, fs=cfg.fs_Hz, f0=f_mech, q=q_notch)
+    rpm_used = float(np.nanmean(rpm_t)) if len(rpm_t) > 0 else cfg.rpm_used()
+    f_mech_used = (rpm_used / 60.0) * float(max(1, cfg.mech_harmonic))
+    q_notch = _notch_q_from_rpm(rpm_used)
+    q_notch_t = _notch_q_from_rpm_vec(rpm_t) if len(rpm_t) > 0 else np.full_like(mu_f0, q_notch, dtype=float)
+
+    rpm_span = float(np.nanmax(rpm_t) - np.nanmin(rpm_t)) if len(rpm_t) > 0 else 0.0
+    use_tv_notch = (rpm_span > 1e-6) and (float(getattr(cfg, "tau_rpm_s", 0.0)) > 0.0)
+
+    if use_tv_notch:
+        f_min = float(np.nanmin(f_mech_t))
+        f_max = float(np.nanmax(f_mech_t))
+        q_min = float(np.nanmin(q_notch_t))
+        q_max = float(np.nanmax(q_notch_t))
+        _cb(progress_cb, 40.0, f"μ 陷波（f_mech∈[{f_min:.6g},{f_max:.6g}]Hz, Q∈[{q_min:.3g},{q_max:.3g}]）...")
+        block_s = min(30.0, max(2.0, float(getattr(cfg, "tau_rpm_s", 0.0)) / 10.0))
+        mu_cl_notch = _iir_notch(mu_f0, fs=cfg.fs_Hz, f0=f_mech_t, q=q_notch_t, block_s=block_s)
+    else:
+        _cb(progress_cb, 40.0, f"μ 陷波（f_mech={f_mech_used:.6g}Hz, Q={q_notch:.3g}）...")
+        mu_cl_notch = _iir_notch(mu_f0, fs=cfg.fs_Hz, f0=f_mech_used, q=q_notch)
 
     _cb(progress_cb, 44.0, "μ 低通滤波...")
     mu_cl_lp = _lowpass(mu_cl_notch, fs=cfg.fs_Hz, fc=cfg.lowpass_fc_hz, order=3).astype(float)
@@ -1101,7 +1256,10 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
         "cfg": cfg,
         "seed": int(seed),
         "derived": {
-            "mech_freq_hz_used": float(f_mech),
+            "rpm_min": float(cfg.rpm_min),
+            "rpm_max": float(cfg.rpm_max),
+            "rpm_used": float(rpm_used),
+            "mech_freq_hz_used": float(f_mech_used),
             "notch_q_used": float(q_notch),
             "mu_runin_start_used": float(mu_runin_start_used),
             "mu_stable_used": float(mu_stable_used),
@@ -1113,6 +1271,9 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
         "series": {
             "t": t,
             "mu_true": mu_true,
+            "rpm_t": rpm_t,
+            "f_mech_t": f_mech_t,
+            "q_notch_t": q_notch_t,
             "open": {"tavg": tavg_open, "th": th_open, "tl": tl_open, "ff": ff_open, "mu_raw": mu_open_raw, "q": q_open},
             "closed": {
                 "tavg": tavg_closed, "th": th_cl, "tl": tl_cl, "ff": ff_cl,
@@ -1141,6 +1302,15 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
     def ds(x): return x[::stride]
     f_mech = float(res["derived"]["mech_freq_hz_used"])
     q_notch = float(res["derived"]["notch_q_used"])
+    rpm_t = res["series"].get("rpm_t")
+    f_mech_t = res["series"].get("f_mech_t")
+    q_notch_t = res["series"].get("q_notch_t")
+    if rpm_t is None:
+        rpm_t = np.full_like(t, float(cfg.rpm_used()), dtype=float)
+    if f_mech_t is None:
+        f_mech_t = (rpm_t / 60.0) * float(max(1, cfg.mech_harmonic))
+    if q_notch_t is None:
+        q_notch_t = np.full_like(t, q_notch, dtype=float)
 
     cl = res["series"]["closed"]
     op = res["series"]["open"]
@@ -1163,9 +1333,9 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
         "mu_notch": ds(cl["mu_notch"]),
         "mu_filt": ds(cl["mu_filt"]),
         "q_valid": ds(cl["q"]).astype(int),
-        "rpm": np.full_like(t_e, float(cfg.rpm), dtype=float),
-        "mech_freq_hz": np.full_like(t_e, f_mech, dtype=float),
-        "notch_q_used": np.full_like(t_e, q_notch, dtype=float),
+        "rpm": ds(rpm_t),
+        "mech_freq_hz": ds(f_mech_t),
+        "notch_q_used": ds(q_notch_t),
         "theta_deg": np.full_like(t_e, float(cfg.theta_deg), dtype=float),
         "t_set_N": np.full_like(t_e, float(cfg.t_set_N), dtype=float),
     })
@@ -1185,9 +1355,9 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
         "phase_severe_ratio": np.full_like(t_e, float(res["derived"].get("phase_severe_ratio_used", np.nan)), dtype=float),
         "mu_raw": ds(op["mu_raw"]),
         "q_valid": ds(op["q"]).astype(int),
-        "rpm": np.full_like(t_e, float(cfg.rpm), dtype=float),
-        "mech_freq_hz": np.full_like(t_e, f_mech, dtype=float),
-        "notch_q_used": np.full_like(t_e, q_notch, dtype=float),
+        "rpm": ds(rpm_t),
+        "mech_freq_hz": ds(f_mech_t),
+        "notch_q_used": ds(q_notch_t),
         "theta_deg": np.full_like(t_e, float(cfg.theta_deg), dtype=float),
         "t_set_N": np.full_like(t_e, float(cfg.t_set_N), dtype=float),
     })
@@ -1494,7 +1664,7 @@ def _cli():
     p.add_argument("--t_set", type=float, default=5.0, help="平均张力设定(N)")
     p.add_argument("--fs", type=float, default=50.0, help="采样率(Hz)（仅生成时间轴）")
     p.add_argument("--duration_s", type=float, default=600.0, help="采样时间(s)（仅生成时间轴）")
-    p.add_argument("--rpm", type=float, default=300.0, help="转速(rpm)（唯一输入主频方式）")
+    p.add_argument("--rpm", type=float, default=300.0, help="转速(rpm)（固定值；CLI 旧模式）")
     p.add_argument("--mech_harmonic", type=int, default=1, help="机械扰动倍频m（1=一次转频）")
     p.add_argument("--out_dir", type=str, default="sim_out", help="输出目录")
     p.add_argument("--seed", type=int, default=7, help="随机种子")
@@ -1510,6 +1680,9 @@ def _cli():
         rpm=args.rpm,
         mech_harmonic=args.mech_harmonic,
     )
+    # CLI 保持旧行为：rpm 固定值
+    cfg.rpm_min = args.rpm
+    cfg.rpm_max = args.rpm
 
     def cb(pct, msg):
         print(f"[{pct:6.2f}%] {msg}")

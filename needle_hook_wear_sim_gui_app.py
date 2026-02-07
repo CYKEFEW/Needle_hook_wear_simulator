@@ -49,7 +49,7 @@ class App(tk.Tk):
 
         self.msg_q = queue.Queue()
         self.worker = None
-        self._ini_path = Path(__file__).resolve().parent / "defaultData.ini"
+        self._init_ini_paths()
 
         self.cfg = SimConfig()  # 默认包角100°，默认rpm=300
         self.out_dir = tk.StringVar(value=os.path.abspath("sim_out"))
@@ -200,9 +200,9 @@ class App(tk.Tk):
         self._update_ratio_labels()
         self._on_lock_change()
 
-        # 扰动：只允许 rpm 输入主频（删除直接输入主频）
+        # 扰动：转速范围输入主频（删除直接输入主频）
         ttk.Label(tab_dist, text="机械周期扰动主频：f_mech = rpm/60*m（仅此方式输入）").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        self._add_entry(tab_dist, "转速 rpm", "rpm", row=1)
+        self._add_range_entry(tab_dist, "转速范围 rpm (min~max)", "rpm_min", "rpm_max", row=1)
         self._add_entry(tab_dist, "倍频 m（1=一次转频）", "mech_harmonic", row=2, is_int=True)
 
         self._add_range_entry(tab_dist, "开环周期幅值 A_mech_open (N)", "mech_amp_open_min", "mech_amp_open_max", row=3)
@@ -214,18 +214,20 @@ class App(tk.Tk):
         self._add_range_entry(tab_dist, "闭环漂移幅值 A_drift_closed (N)", "drift_amp_closed_min", "drift_amp_closed_max", row=9)
         self._add_range_entry(tab_dist, "传感器噪声 RMS_sensor (N)", "sensor_rms_min", "sensor_rms_max", row=10)
 
-        self._add_entry(tab_dist, "机械扰动慢变时间常数 τ_mech (s，<=0关闭)", "tau_mech_s", row=11)
-        self._add_entry(tab_dist, "噪声RMS慢变时间常数 τ_noise (s，<=0关闭)", "tau_noise_s", row=12)
-        self._add_entry(tab_dist, "传感器RMS慢变时间常数 τ_sensor (s，<=0关闭)", "tau_sensor_s", row=13)
-        self._add_entry(tab_dist, "漂移幅值慢变时间常数 τ_driftA (s，<=0关闭)", "tau_drift_amp_s", row=14)
-        self._add_entry(tab_dist, "漂移频率慢变时间常数 τ_driftf (s，<=0关闭)", "tau_drift_freq_s", row=15)
+        self._add_entry(tab_dist, "转速慢变时间常数 τ_rpm (s，<=0关闭)", "tau_rpm_s", row=11)
+        self._add_entry(tab_dist, "机械扰动慢变时间常数 τ_mech (s，<=0关闭)", "tau_mech_s", row=12)
+        self._add_entry(tab_dist, "噪声RMS慢变时间常数 τ_noise (s，<=0关闭)", "tau_noise_s", row=13)
+        self._add_entry(tab_dist, "传感器RMS慢变时间常数 τ_sensor (s，<=0关闭)", "tau_sensor_s", row=14)
+        self._add_entry(tab_dist, "漂移幅值慢变时间常数 τ_driftA (s，<=0关闭)", "tau_drift_amp_s", row=15)
+        self._add_entry(tab_dist, "漂移频率慢变时间常数 τ_driftf (s，<=0关闭)", "tau_drift_freq_s", row=16)
 
 
         # 显示 f_mech 与 Notch Q（自动，派生信息，只读；放在该页最下方，避免与输入框同一行）
         self.f_mech_var = tk.StringVar(value="f_mech = — Hz，Notch Q≈—")
         info_row = tab_dist.grid_size()[1]  # 追加到末尾（下一空行）
         ttk.Label(tab_dist, textvariable=self.f_mech_var).grid(row=info_row, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        self._vars["rpm"].trace_add("write", lambda *_: self._update_f_mech_label())
+        self._vars["rpm_min"].trace_add("write", lambda *_: self._update_f_mech_label())
+        self._vars["rpm_max"].trace_add("write", lambda *_: self._update_f_mech_label())
         self._vars["mech_harmonic"].trace_add("write", lambda *_: self._update_f_mech_label())
         self._update_f_mech_label()
 
@@ -284,11 +286,22 @@ class App(tk.Tk):
 
     def _update_f_mech_label(self):
         try:
-            rpm = float(self._vars["rpm"].get().strip() or 300.0)
+            rpm_min = float(self._vars["rpm_min"].get().strip() or 300.0)
+            rpm_max = float(self._vars["rpm_max"].get().strip() or 300.0)
+            if rpm_min > rpm_max:
+                rpm_min, rpm_max = rpm_max, rpm_min
             m = int(float(self._vars["mech_harmonic"].get().strip() or 1))
-            f = (rpm / 60.0) * max(1, m)
-            q = max(15.0, min(80.0, rpm / 10.0))
-            self.f_mech_var.set(f"f_mech = rpm/60*m = {f:.6g} Hz，Notch Q≈{q:.3g}")
+            m = max(1, m)
+            f_min = (rpm_min / 60.0) * m
+            f_max = (rpm_max / 60.0) * m
+            q_min = max(15.0, min(80.0, rpm_min / 10.0))
+            q_max = max(15.0, min(80.0, rpm_max / 10.0))
+            if abs(rpm_max - rpm_min) < 1e-12:
+                self.f_mech_var.set(f"f_mech = rpm/60*m = {f_max:.6g} Hz，Notch Q≈{q_max:.3g}")
+            else:
+                self.f_mech_var.set(
+                    f"f_mech = rpm/60*m = [{f_min:.6g}, {f_max:.6g}] Hz，Notch Q≈[{q_min:.3g}, {q_max:.3g}]"
+                )
         except Exception:
             self.f_mech_var.set("f_mech=— Hz（输入有误）")
 
@@ -559,15 +572,53 @@ class App(tk.Tk):
                 pass
         bottom.bind("<Configure>", _on_bottom_resize)
 
+    def _init_ini_paths(self):
+        """初始化 ini 路径（兼容 PyInstaller onefile）。"""
+        def _app_dir():
+            if getattr(sys, "frozen", False):
+                return Path(sys.executable).resolve().parent
+            return Path(__file__).resolve().parent
+
+        def _resource_dir():
+            return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+        self._app_dir = _app_dir()
+        self._resource_dir = _resource_dir()
+        self._ini_path = self._app_dir / "defaultData.ini"
+        self._ini_template_path = self._resource_dir / "defaultData.ini"
+
+    def _fallback_ini_path(self) -> Path:
+        base = Path.home() / "needle_hook_wear_sim"
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "defaultData.ini"
+
     def _load_or_create_default_ini(self):
         """启动时读取 defaultData.ini；若不存在则生成。"""
-        try:
+        def _try_load_or_create():
             if self._ini_path.exists():
                 self._read_default_ini()
-            else:
-                self._write_default_ini()
+                return
+            # 优先从打包资源复制
+            if hasattr(self, "_ini_template_path") and self._ini_template_path.exists():
+                try:
+                    self._ini_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._ini_path.write_bytes(self._ini_template_path.read_bytes())
+                    self._read_default_ini()
+                    return
+                except Exception:
+                    pass
+            self._write_default_ini()
+
+        try:
+            _try_load_or_create()
         except Exception as e:
-            self._log(f"读取 defaultData.ini 失败：{e}\n")
+            try:
+                # 尝试切换到用户目录
+                self._ini_path = self._fallback_ini_path()
+                _try_load_or_create()
+                self._log(f"默认参数文件已切换到：{self._ini_path}\n")
+            except Exception as e2:
+                self._log(f"读取 defaultData.ini 失败：{e2}\n")
 
     def _read_default_ini(self):
         """读取 defaultData.ini（UTF-8），将默认值回填到 GUI。"""
@@ -600,6 +651,19 @@ class App(tk.Tk):
                 continue
             if k in sec:
                 var.set(gs(k, var.get()))
+
+        # 兼容旧版：仅有 rpm 时，回填到 rpm_min/rpm_max
+        if ("rpm_min" in self._vars) and ("rpm_max" in self._vars):
+            if ("rpm_min" not in sec) and ("rpm_max" not in sec) and ("rpm" in sec):
+                v = gs("rpm", "300")
+                self._vars["rpm_min"].set(v)
+                self._vars["rpm_max"].set(v)
+            elif ("rpm_min" in sec) and ("rpm_max" not in sec):
+                v = gs("rpm_min", "300")
+                self._vars["rpm_max"].set(v)
+            elif ("rpm_max" in sec) and ("rpm_min" not in sec):
+                v = gs("rpm_max", "300")
+                self._vars["rpm_min"].set(v)
 
         try:
             self.phase_runin_pct.set(float(gs("phase_runin_pct", self.phase_runin_pct.get())))
@@ -645,8 +709,10 @@ class App(tk.Tk):
             "theta_deg": "包角 θ（单位：度）",
             "t_set_N": "平均张力设定值 T_set（单位：N）",
             "fs_Hz": "采样率 fs（Hz，仅用于生成时间轴）",
-            "rpm": "转速（rpm，用于换算机械扰动主频）",
+            "rpm_min": "转速范围下限 rpm_min",
+            "rpm_max": "转速范围上限 rpm_max",
             "mech_harmonic": "机械扰动谐波阶次 m（主频= rpm/60*m）",
+            "tau_rpm_s": "转速慢变时间常数 τ_rpm（s，<=0关闭）",
             "noise_rms_open_min": "开环：高频噪声范围下限（RMS，N）",
             "noise_rms_open_max": "开环：高频噪声范围上限（RMS，N）",
             "noise_rms_closed_min": "闭环：高频噪声范围下限（RMS，N）",
@@ -714,6 +780,7 @@ class App(tk.Tk):
             lines.append(f"; {cmt}")
             lines.append(f"{k}={v}")
             lines.append("")
+        self._ini_path.parent.mkdir(parents=True, exist_ok=True)
         self._ini_path.write_text("\n".join(lines), encoding="utf-8")
         self._log("已写入 defaultData.ini 默认参数。\n")
 
@@ -759,8 +826,10 @@ class App(tk.Tk):
             "t_set_N": "平均张力设定值 T_set（单位：N）",
             "fs_Hz": "采样率 fs（Hz，仅用于生成时间轴）",
             "duration_s": "采样时间（秒，内部字段；GUI 使用 duration_h 显示）",
-            "rpm": "转速（rpm，用于换算机械扰动主频）",
+            "rpm_min": "转速范围下限 rpm_min",
+            "rpm_max": "转速范围上限 rpm_max",
             "mech_harmonic": "机械扰动谐波阶次 m（主频= rpm/60*m）",
+            "tau_rpm_s": "转速慢变时间常数 τ_rpm（s，<=0关闭）",
             "noise_rms_open_min": "开环：高频噪声范围下限（RMS，N）",
             "noise_rms_open_max": "开环：高频噪声范围上限（RMS，N）",
             "noise_rms_closed_min": "闭环：高频噪声范围下限（RMS，N）",
@@ -823,6 +892,7 @@ class App(tk.Tk):
             lines.append(f"; {cmt}")
             lines.append(f"{k}={v}")
             lines.append("")
+        self._ini_path.parent.mkdir(parents=True, exist_ok=True)
         self._ini_path.write_text("\n".join(lines), encoding="utf-8")
 
     def _on_close(self):
