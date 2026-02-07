@@ -310,6 +310,16 @@ def _write_xlsx_multisheet(
     max_cells_for_column = 5_000_000
     use_column_write = total_cells <= max_cells_for_column
 
+    def _display_width(s: str) -> int:
+        import unicodedata
+        w = 0
+        for ch in s:
+            if unicodedata.east_asian_width(ch) in ("W", "F"):
+                w += 2
+            else:
+                w += 1
+        return w
+
     def _cell_len(v) -> int:
         if v is None:
             return 0
@@ -318,7 +328,7 @@ def _write_xlsx_multisheet(
                 return 0
         except Exception:
             pass
-        return len(str(v))
+        return _display_width(str(v))
 
     def _normalize_value(v):
         if v is None:
@@ -1382,6 +1392,38 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
         "t_avg_open_N": ds(op["tavg"])[cmp_mask],
         "t_avg_closed_N": ds(cl["tavg"])[cmp_mask],
     })
+
+    # 列名添加中文括号注释
+    col_note = {
+        "t_s": "t_s（时间s）",
+        "t_high_N": "t_high_N（高张力N）",
+        "t_low_N": "t_low_N（低张力N）",
+        "t_avg_N": "t_avg_N（平均张力N）",
+        "f_fric_N": "f_fric_N（摩擦力N）",
+        "mu_true": "mu_true（μ真值）",
+        "mu_runin_start_used": "mu_runin_start_used（磨合μ起始）",
+        "mu_stable_used": "mu_stable_used（稳定μ）",
+        "mu_severe_end_used": "mu_severe_end_used（加速μ末值）",
+        "phase_runin_ratio": "phase_runin_ratio（磨合比例）",
+        "phase_stable_ratio": "phase_stable_ratio（稳定比例）",
+        "phase_severe_ratio": "phase_severe_ratio（加速比例）",
+        "mu_raw": "mu_raw（μ原始）",
+        "mu_hampel": "mu_hampel（μ去毛刺）",
+        "mu_notch": "mu_notch（μ陷波）",
+        "mu_filt": "mu_filt（μ低通）",
+        "q_valid": "q_valid（有效标记）",
+        "rpm": "rpm（转速rpm）",
+        "mech_freq_hz": "mech_freq_hz（主频Hz）",
+        "notch_q_used": "notch_q_used（陷波Q）",
+        "theta_deg": "theta_deg（包角deg）",
+        "t_set_N": "t_set_N（设定张力N）",
+        "t_avg_open_N": "t_avg_open_N（开环平均张力N）",
+        "t_avg_closed_N": "t_avg_closed_N（闭环平均张力N）",
+    }
+
+    closed_df.rename(columns=col_note, inplace=True)
+    open_df.rename(columns=col_note, inplace=True)
+    compare_df.rename(columns=col_note, inplace=True)
 
     xlsx_path = os.path.join(out_dir, "needle_hook_wear_sim.xlsx")
     _cb(progress_cb, 55.0, "开始写入 xlsx（多sheet，必要时自动拆分）...")
