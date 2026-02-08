@@ -462,8 +462,8 @@ class SimConfig:
     # 阶段过渡速度系数（用于调整“段间过渡速度”，保证连续）
     # - 磨合→稳定：系数越大，衰减越快（过渡越快）
     # - 稳定→加速：系数越大，S 形上升越陡（过渡越快）
-    trans_runin2stable_k: float = 2.0
-    trans_stable2severe_k: float = 5.0
+    trans_runin2stable_k: float = 5.0
+    trans_stable2severe_k: float = 2.0
 
     # 开环-闭环对比输出范围（单位：s）
     # - (0, -1) 表示全部输出（默认）
@@ -1699,50 +1699,50 @@ def run_simulation(cfg: SimConfig, seed: int, out_dir: str, plot_lang: str = "zh
     return {"res": res, "outputs": outputs}
 
 
-def _cli():
-    import argparse
-    p = argparse.ArgumentParser(description="针钩磨损平台全过程仿真（核心引擎）")
-    p.add_argument("--theta_deg", type=float, default=20.0, help="包角(度)（默认20）")
-    p.add_argument("--t_set", type=float, default=5.0, help="平均张力设定(N)")
-    p.add_argument("--fs", type=float, default=50.0, help="采样率(Hz)（仅生成时间轴）")
-    p.add_argument("--duration_s", type=float, default=600.0, help="采样时间(s)（仅生成时间轴）")
-    p.add_argument("--rpm", type=float, default=300.0, help="转速(rpm)（固定值；CLI 旧模式）")
-    p.add_argument("--mech_harmonic", type=int, default=1, help="机械扰动倍频m（1=一次转频）")
-    p.add_argument("--out_dir", type=str, default="sim_out", help="输出目录")
-    p.add_argument("--seed", type=int, default=7, help="随机种子")
-    p.add_argument("--mode", type=str, default="both", choices=["both", "xlsx", "plots"], help="导出模式")
-    p.add_argument("--plot_lang", type=str, default="zh", choices=["zh", "en"], help="图片语言")
-    args = p.parse_args()
+# def _cli():
+#     import argparse
+#     p = argparse.ArgumentParser(description="针钩磨损平台全过程仿真（核心引擎）")
+#     p.add_argument("--theta_deg", type=float, default=20.0, help="包角(度)（默认20）")
+#     p.add_argument("--t_set", type=float, default=5.0, help="平均张力设定(N)")
+#     p.add_argument("--fs", type=float, default=50.0, help="采样率(Hz)（仅生成时间轴）")
+#     p.add_argument("--duration_s", type=float, default=600.0, help="采样时间(s)（仅生成时间轴）")
+#     p.add_argument("--rpm", type=float, default=300.0, help="转速(rpm)（固定值；CLI 旧模式）")
+#     p.add_argument("--mech_harmonic", type=int, default=1, help="机械扰动倍频m（1=一次转频）")
+#     p.add_argument("--out_dir", type=str, default="sim_out", help="输出目录")
+#     p.add_argument("--seed", type=int, default=7, help="随机种子")
+#     p.add_argument("--mode", type=str, default="both", choices=["both", "xlsx", "plots"], help="导出模式")
+#     p.add_argument("--plot_lang", type=str, default="zh", choices=["zh", "en"], help="图片语言")
+#     args = p.parse_args()
 
-    cfg = SimConfig(
-        theta_deg=args.theta_deg,
-        t_set_N=args.t_set,
-        fs_Hz=args.fs,
-        duration_s=args.duration_s,
-        rpm=args.rpm,
-        mech_harmonic=args.mech_harmonic,
-    )
-    # CLI 保持旧行为：rpm 固定值
-    cfg.rpm_min = args.rpm
-    cfg.rpm_max = args.rpm
+#     cfg = SimConfig(
+#         theta_deg=args.theta_deg,
+#         t_set_N=args.t_set,
+#         fs_Hz=args.fs,
+#         duration_s=args.duration_s,
+#         rpm=args.rpm,
+#         mech_harmonic=args.mech_harmonic,
+#     )
+#     # CLI 保持旧行为：rpm 固定值
+#     cfg.rpm_min = args.rpm
+#     cfg.rpm_max = args.rpm
 
-    def cb(pct, msg):
-        print(f"[{pct:6.2f}%] {msg}")
+#     def cb(pct, msg):
+#         print(f"[{pct:6.2f}%] {msg}")
 
-    run_simulation(cfg, seed=args.seed, out_dir=args.out_dir, plot_lang=args.plot_lang, mode=args.mode, progress_cb=cb)
-    print("完成。输出目录：", os.path.abspath(args.out_dir))
+#     run_simulation(cfg, seed=args.seed, out_dir=args.out_dir, plot_lang=args.plot_lang, mode=args.mode, progress_cb=cb)
+#     print("完成。输出目录：", os.path.abspath(args.out_dir))
 
 
-if __name__ == "__main__":
-    _cli()
+# if __name__ == "__main__":
+#     _cli()
 
-    # 阶段过渡速度系数（用于调整“段间过渡速度”，保证连续）
-    # - 磨合→稳定：系数越大，衰减越快（过渡越快）
-    # - 稳定→加速：系数越大，S 形上升越陡（过渡越快）
-    trans_runin2stable_k: float = 1.0
-    trans_stable2severe_k: float = 1.0
+#     # 阶段过渡速度系数（用于调整“段间过渡速度”，保证连续）
+#     # - 磨合→稳定：系数越大，衰减越快（过渡越快）
+#     # - 稳定→加速：系数越大，S 形上升越陡（过渡越快）
+#     trans_runin2stable_k: float = 1.0
+#     trans_stable2severe_k: float = 1.0
 
-    # 开环-闭环对比输出范围（单位：s）
-    # - (0, -1) 表示全部输出（默认）
-    compare_t_start_s: float = 0.0
-    compare_t_end_s: float = -1.0
+#     # 开环-闭环对比输出范围（单位：s）
+#     # - (0, -1) 表示全部输出（默认）
+#     compare_t_start_s: float = 0.0
+#     compare_t_end_s: float = -1.0
