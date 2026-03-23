@@ -24,11 +24,13 @@ from tkinter import ttk, filedialog, messagebox
 from needle_hook_wear_simulator_gui import (
     SimConfig,
     simulate,
-    export_xlsx,
+    export_data,
     export_plots,
     export_summary,
     setup_plot_font,
     HAVE_SCIPY,
+    EXPORT_COLUMN_SPECS,
+    DEFAULT_EXPORT_COLUMNS,
 )
 
 
@@ -56,6 +58,17 @@ class App(tk.Tk):
         self.seed = tk.IntVar(value=7)
 
         self.plot_lang = tk.StringVar(value="zh")  # zh / en
+        self.data_export_format = tk.StringVar(value="xlsx")
+        self.export_column_vars = {
+            key: tk.BooleanVar(value=(key in DEFAULT_EXPORT_COLUMNS))
+            for key, _ in EXPORT_COLUMN_SPECS
+        }
+        self.invalid_ratio_pct = tk.StringVar(value=f"{float(getattr(self.cfg, 'invalid_ratio', 0.0005)) * 100.0:.6g}")
+        self.phase_control_mode = tk.StringVar(value=str(getattr(self.cfg, "phase_control_mode", "ratio")))
+        self.phase_runin_tlife_pct = tk.DoubleVar(value=float(getattr(self.cfg, "runin_ratio_by_tlife", self.cfg.phase_runin_ratio)) * 100.0)
+        self._lbl_runin_tlife = tk.StringVar()
+        self.target_tlife_s = tk.StringVar(value=f"{float(getattr(self.cfg, 'target_tlife_s', self.cfg.duration_s * (self.cfg.phase_runin_ratio + self.cfg.phase_stable_ratio))):.6f}")
+        self.phase_tlife_info = tk.StringVar()
 
         # 开环-闭环对比输出范围（单位：s），(0,-1)=全部
         self.compare_t_start_s = tk.StringVar(value=str(getattr(self.cfg, "compare_t_start_s", 0.0)))
@@ -124,81 +137,109 @@ class App(tk.Tk):
         self._add_entry(tab_core, "采样时间 duration (h) 仅生成时间轴", "duration_h")
 
 
-        # 阶段比例（滑块 + 可输入百分比 + 可锁定一个阶段，总和=100%）
-        ttk.Label(tab_phase, text="阶段时间比例（滑块/输入；自动保持总和=100%）").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        # 阶段控制方式
         tab_phase.columnconfigure(1, weight=1)
+        ttk.Label(tab_phase, text="阶段控制方式").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        mode_box = ttk.Frame(tab_phase)
+        mode_box.grid(row=0, column=1, columnspan=3, sticky="w", pady=(0, 4))
+        self._phase_mode_btn_ratio = ttk.Radiobutton(mode_box, text="阶段时间比例", variable=self.phase_control_mode, value="ratio", command=self._update_phase_mode_state)
+        self._phase_mode_btn_ratio.pack(side="left", padx=(0, 10))
+        self._phase_mode_btn_tlife = ttk.Radiobutton(mode_box, text="磨合比例 + tlife", variable=self.phase_control_mode, value="runin_tlife", command=self._update_phase_mode_state)
+        self._phase_mode_btn_tlife.pack(side="left")
+        ttk.Label(tab_phase, text="方式1直接控制三段时间比例；方式2控制磨合段比例和 tlife，并自动推导稳定/加速比例。").grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         self._ratio_lock = False
-        # 三段比例（单位：%）
         self.phase_runin_pct = tk.DoubleVar(value=float(self.cfg.phase_runin_ratio) * 100.0)
         self.phase_stable_pct = tk.DoubleVar(value=float(self.cfg.phase_stable_ratio) * 100.0)
         self.phase_severe_pct = tk.DoubleVar(value=float(self.cfg.phase_severe_ratio) * 100.0)
-
-        # 允许锁定一个阶段（锁定后该滑块与输入框禁用）
         self.locked_phase = tk.StringVar(value="none")  # none/runin/stable/severe
-
-        # 输入框变量（百分比数值，不带%）
         self._lbl_runin = tk.StringVar()
         self._lbl_stable = tk.StringVar()
         self._lbl_severe = tk.StringVar()
         self.phase_sum_label = tk.StringVar()
 
-        # 锁定选择
-        ttk.Label(tab_phase, text="锁定：").grid(row=1, column=0, sticky="w", pady=4)
-        lock_box = ttk.Frame(tab_phase)
-        lock_box.grid(row=1, column=1, columnspan=3, sticky="w", pady=4)
-        ttk.Radiobutton(lock_box, text="不锁定", variable=self.locked_phase, value="none", command=self._on_lock_change).pack(side="left", padx=(0, 10))
-        ttk.Radiobutton(lock_box, text="锁定磨合", variable=self.locked_phase, value="runin", command=self._on_lock_change).pack(side="left", padx=(0, 10))
-        ttk.Radiobutton(lock_box, text="锁定稳定", variable=self.locked_phase, value="stable", command=self._on_lock_change).pack(side="left", padx=(0, 10))
-        ttk.Radiobutton(lock_box, text="锁定加速", variable=self.locked_phase, value="severe", command=self._on_lock_change).pack(side="left", padx=(0, 10))
+        ttk.Label(tab_phase, text="阶段比例（%）").grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 4))
 
-        # 三段：滑块 + 输入框
-        ttk.Label(tab_phase, text="磨合阶段").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(tab_phase, text="磨合阶段").grid(row=3, column=0, sticky="w", pady=4)
         self._scale_runin = ttk.Scale(tab_phase, from_=0.0, to=100.0, variable=self.phase_runin_pct,
                                       command=lambda _v: self._on_ratio_change("runin"))
-        self._scale_runin.grid(row=2, column=1, sticky="we", pady=4, padx=(0, 8))
+        self._scale_runin.grid(row=3, column=1, sticky="we", pady=4, padx=(0, 8))
         self._entry_runin = ttk.Entry(tab_phase, textvariable=self._lbl_runin, width=8)
-        self._entry_runin.grid(row=2, column=2, sticky="w")
-        ttk.Label(tab_phase, text="%").grid(row=2, column=3, sticky="w", padx=(4, 0))
+        self._entry_runin.grid(row=3, column=2, sticky="w")
+        ttk.Label(tab_phase, text="%").grid(row=3, column=3, sticky="w", padx=(4, 0))
         self._entry_runin.bind("<Return>", lambda _e: self._on_ratio_entry("runin"))
         self._entry_runin.bind("<FocusOut>", lambda _e: self._on_ratio_entry("runin"))
 
-        ttk.Label(tab_phase, text="稳定磨损阶段").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(tab_phase, text="稳定磨损阶段").grid(row=4, column=0, sticky="w", pady=4)
         self._scale_stable = ttk.Scale(tab_phase, from_=0.0, to=100.0, variable=self.phase_stable_pct,
                                        command=lambda _v: self._on_ratio_change("stable"))
-        self._scale_stable.grid(row=3, column=1, sticky="we", pady=4, padx=(0, 8))
+        self._scale_stable.grid(row=4, column=1, sticky="we", pady=4, padx=(0, 8))
         self._entry_stable = ttk.Entry(tab_phase, textvariable=self._lbl_stable, width=8)
-        self._entry_stable.grid(row=3, column=2, sticky="w")
-        ttk.Label(tab_phase, text="%").grid(row=3, column=3, sticky="w", padx=(4, 0))
+        self._entry_stable.grid(row=4, column=2, sticky="w")
+        ttk.Label(tab_phase, text="%").grid(row=4, column=3, sticky="w", padx=(4, 0))
         self._entry_stable.bind("<Return>", lambda _e: self._on_ratio_entry("stable"))
         self._entry_stable.bind("<FocusOut>", lambda _e: self._on_ratio_entry("stable"))
 
-        ttk.Label(tab_phase, text="加速磨损阶段").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(tab_phase, text="加速磨损阶段").grid(row=5, column=0, sticky="w", pady=4)
         self._scale_severe = ttk.Scale(tab_phase, from_=0.0, to=100.0, variable=self.phase_severe_pct,
                                        command=lambda _v: self._on_ratio_change("severe"))
-        self._scale_severe.grid(row=4, column=1, sticky="we", pady=4, padx=(0, 8))
+        self._scale_severe.grid(row=5, column=1, sticky="we", pady=4, padx=(0, 8))
         self._entry_severe = ttk.Entry(tab_phase, textvariable=self._lbl_severe, width=8)
-        self._entry_severe.grid(row=4, column=2, sticky="w")
-        ttk.Label(tab_phase, text="%").grid(row=4, column=3, sticky="w", padx=(4, 0))
+        self._entry_severe.grid(row=5, column=2, sticky="w")
+        ttk.Label(tab_phase, text="%").grid(row=5, column=3, sticky="w", padx=(4, 0))
         self._entry_severe.bind("<Return>", lambda _e: self._on_ratio_entry("severe"))
         self._entry_severe.bind("<FocusOut>", lambda _e: self._on_ratio_entry("severe"))
 
-        ttk.Label(tab_phase, textvariable=self.phase_sum_label).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 10))
+        ttk.Label(tab_phase, textvariable=self.phase_sum_label).grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 6))
 
-        # μ 范围输入（min/max）
-        ttk.Label(tab_phase, text="三阶段摩擦系数范围（min/max；若 min==max 即固定值）").grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        self._add_entry(tab_phase, "磨合段 μ范围：min", "mu_runin_min", row=6)
-        self._add_entry(tab_phase, "磨合段 μ范围：max", "mu_runin_max", row=7)
-        self._add_entry(tab_phase, "稳定段 μ范围：min", "mu_stable_min", row=8)
-        self._add_entry(tab_phase, "稳定段 μ范围：max", "mu_stable_max", row=9)
-        self._add_entry(tab_phase, "加速段 μ范围：min", "mu_severe_min", row=10)
-        self._add_entry(tab_phase, "加速段 μ范围：max", "mu_severe_max", row=11)
-        # 段间过渡速度系数（放在“阶段比例/μ范围”区域）
-        self._add_entry(tab_phase, "磨合→稳定过渡系数 k_rs（越大越快）", "trans_runin2stable_k", row=12)
-        self._add_entry(tab_phase, "稳定→加速过渡系数 k_sa（越大越快）", "trans_stable2severe_k", row=13)
+        ttk.Label(tab_phase, text="锁定一个阶段").grid(row=7, column=0, sticky="w", pady=4)
+        lock_box = ttk.Frame(tab_phase)
+        lock_box.grid(row=7, column=1, columnspan=3, sticky="w", pady=4)
+        self._lock_btn_none = ttk.Radiobutton(lock_box, text="不锁定", variable=self.locked_phase, value="none", command=self._on_lock_change)
+        self._lock_btn_none.pack(side="left", padx=(0, 10))
+        self._lock_btn_runin = ttk.Radiobutton(lock_box, text="锁定磨合", variable=self.locked_phase, value="runin", command=self._on_lock_change)
+        self._lock_btn_runin.pack(side="left", padx=(0, 10))
+        self._lock_btn_stable = ttk.Radiobutton(lock_box, text="锁定稳定", variable=self.locked_phase, value="stable", command=self._on_lock_change)
+        self._lock_btn_stable.pack(side="left", padx=(0, 10))
+        self._lock_btn_severe = ttk.Radiobutton(lock_box, text="锁定加速", variable=self.locked_phase, value="severe", command=self._on_lock_change)
+        self._lock_btn_severe.pack(side="left", padx=(0, 10))
+        self._lock_buttons = [self._lock_btn_none, self._lock_btn_runin, self._lock_btn_stable, self._lock_btn_severe]
+
+        alt_box = ttk.LabelFrame(tab_phase, text="磨合比例 + tlife 控制", padding=8)
+        alt_box.grid(row=8, column=0, columnspan=4, sticky="we", pady=(6, 10))
+        alt_box.columnconfigure(1, weight=1)
+        ttk.Label(alt_box, text="磨合段比例").grid(row=0, column=0, sticky="w", pady=4)
+        self._scale_runin_tlife = ttk.Scale(alt_box, from_=0.0, to=100.0, variable=self.phase_runin_tlife_pct,
+                                            command=lambda _v: self._on_runin_tlife_change())
+        self._scale_runin_tlife.grid(row=0, column=1, sticky="we", pady=4, padx=(0, 8))
+        self._entry_runin_tlife = ttk.Entry(alt_box, textvariable=self._lbl_runin_tlife, width=8)
+        self._entry_runin_tlife.grid(row=0, column=2, sticky="w")
+        ttk.Label(alt_box, text="%").grid(row=0, column=3, sticky="w", padx=(4, 0))
+        self._entry_runin_tlife.bind("<Return>", lambda _e: self._on_runin_tlife_entry())
+        self._entry_runin_tlife.bind("<FocusOut>", lambda _e: self._on_runin_tlife_entry())
+
+        ttk.Label(alt_box, text="目标 tlife (s)").grid(row=1, column=0, sticky="w", pady=4)
+        self._entry_target_tlife = ttk.Entry(alt_box, textvariable=self.target_tlife_s, width=12)
+        self._entry_target_tlife.grid(row=1, column=1, sticky="w", pady=4)
+        self._entry_target_tlife.bind("<Return>", lambda _e: self._update_runin_tlife_labels())
+        self._entry_target_tlife.bind("<FocusOut>", lambda _e: self._update_runin_tlife_labels())
+        ttk.Label(alt_box, textvariable=self.phase_tlife_info).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        ttk.Label(tab_phase, text="三阶段摩擦系数范围（min/max；若 min==max 即固定值）").grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        self._add_entry(tab_phase, "磨合段 μ范围：min", "mu_runin_min", row=10)
+        self._add_entry(tab_phase, "磨合段 μ范围：max", "mu_runin_max", row=11)
+        self._add_entry(tab_phase, "稳定段 μ范围：min", "mu_stable_min", row=12)
+        self._add_entry(tab_phase, "稳定段 μ范围：max", "mu_stable_max", row=13)
+        self._add_entry(tab_phase, "加速段 μ范围：min", "mu_severe_min", row=14)
+        self._add_entry(tab_phase, "加速段 μ范围：max", "mu_severe_max", row=15)
+        self._add_entry(tab_phase, "磨合→稳定过渡系数 k_rs（越大越快）", "trans_runin2stable_k", row=16)
+        self._add_entry(tab_phase, "稳定→加速过渡系数 k_sa（越大越快）", "trans_stable2severe_k", row=17)
 
         self._update_ratio_labels()
-        self._on_lock_change()
+        self._update_runin_tlife_labels()
+        if "duration_h" in self._vars:
+            self._vars["duration_h"].trace_add("write", lambda *_: self._update_runin_tlife_labels())
+        self._update_phase_mode_state()
 
         # 扰动：转速范围输入主频（删除直接输入主频）
         ttk.Label(tab_dist, text="机械周期扰动主频：f_mech = rpm/60*m（仅此方式输入）").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
@@ -249,11 +290,21 @@ class App(tk.Tk):
         self._add_entry(tab_judge, "稳定有效比例 q_min", "stable_valid_min", row=5)
         self._add_entry(tab_judge, "失效阈值增量 δ（μth=μss*(1+δ)）", "fail_delta", row=6)
         self._add_entry(tab_judge, "持续超限 Wpersist (s)", "fail_hold_s", row=7)
+        ttk.Label(tab_judge, text="invalid 比例（%，quality flag=0）").grid(row=8, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(tab_judge, textvariable=self.invalid_ratio_pct, width=24).grid(row=8, column=1, sticky="w", pady=4)
 
         # 导出/绘图
         ttk.Label(tab_export, text="duration 很长时 xlsx 会很大；可用 stride 抽样导出。绘图会自动降采样。").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self._add_entry(tab_export, "导出步长 stride（1=全量）", "export_stride", row=1, is_int=True)
         self._add_entry(tab_export, "绘图最大点数", "plot_max_points", row=2, is_int=True)
+
+        tab_export.columnconfigure(1, weight=1)
+        fmt_box = ttk.Frame(tab_export)
+        fmt_box.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 4))
+        ttk.Label(fmt_box, text="数据导出格式").pack(side="left")
+        ttk.Radiobutton(fmt_box, text="xlsx", variable=self.data_export_format, value="xlsx").pack(side="left", padx=(10, 0))
+        ttk.Radiobutton(fmt_box, text="SQLite (.db)", variable=self.data_export_format, value="db").pack(side="left", padx=(10, 0))
+        self._build_export_column_checks(tab_export, row=4)
 
     def _add_entry(self, parent, label, field, row=None, is_int=False):
         if row is None:
@@ -283,6 +334,122 @@ class App(tk.Tk):
         self._vars[field_max] = vmax
         self._types[field_min] = float
         self._types[field_max] = float
+
+    def _get_selected_export_columns(self):
+        return [
+            key
+            for key, _ in EXPORT_COLUMN_SPECS
+            if self.export_column_vars[key].get()
+        ]
+
+    def _export_columns_to_ini_value(self):
+        return ",".join(self._get_selected_export_columns())
+
+    def _set_export_columns_from_csv(self, raw_value):
+        raw = str(raw_value or "").strip()
+        tokens = {part.strip() for part in raw.split(",") if part.strip()}
+        selected = [key for key, _ in EXPORT_COLUMN_SPECS if key in tokens]
+        if not selected:
+            selected = list(DEFAULT_EXPORT_COLUMNS)
+        selected_set = set(selected)
+        for key, _ in EXPORT_COLUMN_SPECS:
+            self.export_column_vars[key].set(key in selected_set)
+
+    def _build_export_column_checks(self, parent, row):
+        box = ttk.LabelFrame(parent, text="数据导出列", padding=8)
+        box.grid(row=row, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        for col in range(3):
+            box.columnconfigure(col, weight=1)
+
+        for idx, (key, label) in enumerate(EXPORT_COLUMN_SPECS):
+            r = idx // 3
+            c = idx % 3
+            ttk.Checkbutton(
+                box,
+                text=label,
+                variable=self.export_column_vars[key],
+            ).grid(row=r, column=c, sticky="w", padx=(0, 12), pady=2)
+
+    def _set_widget_state(self, w, enabled: bool):
+        if w is None:
+            return
+        try:
+            w.state(["!disabled"] if enabled else ["disabled"])
+        except Exception:
+            try:
+                w.configure(state=("normal" if enabled else "disabled"))
+            except Exception:
+                pass
+
+    def _update_runin_tlife_labels(self):
+        try:
+            runin_pct = max(0.0, min(100.0, float(self.phase_runin_tlife_pct.get())))
+        except Exception:
+            runin_pct = 0.0
+        self.phase_runin_tlife_pct.set(runin_pct)
+        self._lbl_runin_tlife.set(f"{runin_pct:.2f}")
+
+        try:
+            duration_h = float(self._vars["duration_h"].get().strip())
+            duration_s = max(0.0, duration_h * 3600.0)
+        except Exception:
+            duration_s = float(getattr(self.cfg, "duration_s", 0.0))
+
+        try:
+            tlife_s = float(self.target_tlife_s.get().strip())
+        except Exception:
+            tlife_s = duration_s * max(0.0, min(1.0, runin_pct / 100.0))
+
+        if duration_s <= 0.0:
+            self.phase_tlife_info.set("待输入有效 duration 和 tlife 后，可自动推导稳定/加速比例。")
+            return
+
+        fs = max(1e-9, float(getattr(self.cfg, "fs_Hz", 1.0)))
+        min_tlife = min(duration_s, duration_s * (runin_pct / 100.0) + 1.0 / fs)
+        tlife_s = max(min_tlife, min(duration_s, tlife_s))
+        stable_pct = max(0.0, (tlife_s / duration_s) * 100.0 - runin_pct)
+        severe_pct = max(0.0, 100.0 - runin_pct - stable_pct)
+        self.phase_tlife_info.set(
+            f"按当前 duration 推导：稳定≈{stable_pct:.2f}% / 加速≈{severe_pct:.2f}%；tlife≈{tlife_s:.2f}s"
+        )
+
+    def _on_runin_tlife_change(self):
+        self._update_runin_tlife_labels()
+
+    def _on_runin_tlife_entry(self):
+        try:
+            self.phase_runin_tlife_pct.set(float(self._lbl_runin_tlife.get().strip()))
+        except Exception:
+            pass
+        self._update_runin_tlife_labels()
+
+    def _update_phase_mode_state(self):
+        ratio_mode = (self.phase_control_mode.get() == "ratio")
+        lock = self.locked_phase.get() if hasattr(self, "locked_phase") else "none"
+
+        self._set_widget_state(getattr(self, "_phase_mode_btn_ratio", None), True)
+        self._set_widget_state(getattr(self, "_phase_mode_btn_tlife", None), True)
+
+        for btn in getattr(self, "_lock_buttons", []):
+            self._set_widget_state(btn, ratio_mode)
+
+        if ratio_mode:
+            self._on_lock_change()
+        else:
+            for w in [
+                getattr(self, "_scale_runin", None),
+                getattr(self, "_entry_runin", None),
+                getattr(self, "_scale_stable", None),
+                getattr(self, "_entry_stable", None),
+                getattr(self, "_scale_severe", None),
+                getattr(self, "_entry_severe", None),
+            ]:
+                self._set_widget_state(w, False)
+
+        self._set_widget_state(getattr(self, "_scale_runin_tlife", None), not ratio_mode)
+        self._set_widget_state(getattr(self, "_entry_runin_tlife", None), not ratio_mode)
+        self._set_widget_state(getattr(self, "_entry_target_tlife", None), not ratio_mode)
+        self._update_runin_tlife_labels()
 
     def _update_f_mech_label(self):
         try:
@@ -319,6 +486,9 @@ class App(tk.Tk):
 
     def _on_ratio_change(self, changed: str):
         """保持三段比例和为 100%。支持锁定一个阶段；未锁定时尽量保留另外两段的相对比例。"""
+        if getattr(self, "phase_control_mode", None) is not None and self.phase_control_mode.get() != "ratio":
+            self._update_ratio_labels()
+            return
         if getattr(self, "_ratio_lock", False):
             return
         self._ratio_lock = True
@@ -446,6 +616,9 @@ class App(tk.Tk):
 
     def _on_ratio_entry(self, which: str):
         """从输入框读取百分比并应用（回车或失焦触发）"""
+        if getattr(self, "phase_control_mode", None) is not None and self.phase_control_mode.get() != "ratio":
+            self._update_ratio_labels()
+            return
         if getattr(self, "_ratio_lock", False):
             return
         try:
@@ -467,23 +640,24 @@ class App(tk.Tk):
         """锁定一个阶段：禁用对应滑块与输入框"""
         lock = self.locked_phase.get() if hasattr(self, "locked_phase") else "none"
 
-        def set_widget_state(w, enabled: bool):
-            if w is None:
-                return
-            try:
-                w.state(["!disabled"] if enabled else ["disabled"])
-            except Exception:
-                try:
-                    w.configure(state=("normal" if enabled else "disabled"))
-                except Exception:
-                    pass
+        if getattr(self, "phase_control_mode", None) is not None and self.phase_control_mode.get() != "ratio":
+            for w in [
+                getattr(self, "_scale_runin", None),
+                getattr(self, "_entry_runin", None),
+                getattr(self, "_scale_stable", None),
+                getattr(self, "_entry_stable", None),
+                getattr(self, "_scale_severe", None),
+                getattr(self, "_entry_severe", None),
+            ]:
+                self._set_widget_state(w, False)
+            return
 
-        set_widget_state(getattr(self, "_scale_runin", None), lock != "runin")
-        set_widget_state(getattr(self, "_entry_runin", None), lock != "runin")
-        set_widget_state(getattr(self, "_scale_stable", None), lock != "stable")
-        set_widget_state(getattr(self, "_entry_stable", None), lock != "stable")
-        set_widget_state(getattr(self, "_scale_severe", None), lock != "severe")
-        set_widget_state(getattr(self, "_entry_severe", None), lock != "severe")
+        self._set_widget_state(getattr(self, "_scale_runin", None), lock != "runin")
+        self._set_widget_state(getattr(self, "_entry_runin", None), lock != "runin")
+        self._set_widget_state(getattr(self, "_scale_stable", None), lock != "stable")
+        self._set_widget_state(getattr(self, "_entry_stable", None), lock != "stable")
+        self._set_widget_state(getattr(self, "_scale_severe", None), lock != "severe")
+        self._set_widget_state(getattr(self, "_entry_severe", None), lock != "severe")
 
         # 切换锁定后，做一次归一化
         self._on_ratio_change("runin")
@@ -522,8 +696,8 @@ class App(tk.Tk):
         ttk.Button(right_btns, text="恢复默认值", command=self._restore_defaults).pack(side="left", padx=(0, 10))
         ttk.Button(right_btns, text="重置默认值", command=self._reset_defaults).pack(side="left", padx=(0, 10))
         ttk.Button(right_btns, text="保存默认值", command=self._save_defaults).pack(side="left")
-# 两个按钮：导出 xlsx / 导出 图片
-        self.btn_xlsx = ttk.Button(box, text="导出 xlsx", command=self._start_export_xlsx)
+# 两个按钮：导出数据 / 导出 图片
+        self.btn_xlsx = ttk.Button(box, text="导出数据", command=self._start_export_data)
         self.btn_xlsx.grid(row=5, column=0, sticky="we", pady=(8, 4))
         self.btn_plots = ttk.Button(box, text="导出 图片", command=self._start_export_plots)
         self.btn_plots.grid(row=5, column=1, sticky="we", pady=(8, 4), padx=(6, 0))
@@ -635,6 +809,15 @@ class App(tk.Tk):
         except Exception:
             pass
         self.plot_lang.set(gs("plot_lang", self.plot_lang.get()))
+        self.data_export_format.set(gs("data_export_format", self.data_export_format.get()))
+        self._set_export_columns_from_csv(gs("data_export_columns", self._export_columns_to_ini_value()))
+        self.invalid_ratio_pct.set(gs("invalid_ratio_pct", self.invalid_ratio_pct.get()))
+        self.phase_control_mode.set(gs("phase_control_mode", self.phase_control_mode.get()))
+        try:
+            self.phase_runin_tlife_pct.set(float(gs("runin_ratio_by_tlife_pct", self.phase_runin_tlife_pct.get())))
+        except Exception:
+            pass
+        self.target_tlife_s.set(gs("target_tlife_s", self.target_tlife_s.get()))
         self.compare_t_start_s.set(gs("compare_t_start_s", self.compare_t_start_s.get()))
         self.compare_t_end_s.set(gs("compare_t_end_s", self.compare_t_end_s.get()))
 
@@ -672,10 +855,11 @@ class App(tk.Tk):
             self._on_ratio_change("runin")
         except Exception:
             pass
+        self._update_runin_tlife_labels()
 
         if hasattr(self, "locked_phase") and ("locked_phase" in sec):
             self.locked_phase.set(gs("locked_phase", "none"))
-            self._on_lock_change()
+        self._update_phase_mode_state()
 
 
         self._log("已读取 defaultData.ini 默认参数。\n")
@@ -704,6 +888,14 @@ class App(tk.Tk):
             ("phase_stable_pct", "稳定磨损阶段比例（%）", f"{float(self.phase_stable_pct.get()):.6f}"),
             ("phase_severe_pct", "加速磨损阶段比例（%）", f"{float(self.phase_severe_pct.get()):.6f}"),
         ]
+        items.extend([
+            ("phase_control_mode", "阶段控制方式：ratio 或 runin_tlife", self.phase_control_mode.get()),
+            ("runin_ratio_by_tlife_pct", "磨合比例 + tlife 控制的磨合段比例（%）", f"{float(self.phase_runin_tlife_pct.get()):.6f}"),
+            ("target_tlife_s", "磨合比例 + tlife 控制的目标 tlife（s）", self.target_tlife_s.get()),
+            ("invalid_ratio_pct", "invalid 比例（%，quality flag=0）", self.invalid_ratio_pct.get()),
+            ("data_export_format", "数据导出格式：xlsx 或 db(SQLite)", self.data_export_format.get()),
+            ("data_export_columns", "数据导出列（逗号分隔）", self._export_columns_to_ini_value()),
+        ])
 
         sim_comments = {
             "theta_deg": "包角 θ（单位：度）",
@@ -797,9 +989,15 @@ class App(tk.Tk):
         out_dir0 = os.path.abspath("sim_out")
         seed0 = 7
         plot_lang0 = "zh"
+        data_export_format0 = "xlsx"
+        data_export_columns0 = ",".join(DEFAULT_EXPORT_COLUMNS)
         compare_t_start0 = 0.0
         compare_t_end0 = -1.0
         locked_phase0 = "none"
+        phase_control_mode0 = str(getattr(cfg0, "phase_control_mode", "ratio"))
+        runin_ratio_by_tlife_pct0 = float(getattr(cfg0, "runin_ratio_by_tlife", cfg0.phase_runin_ratio)) * 100.0
+        target_tlife_s0 = float(getattr(cfg0, "target_tlife_s", cfg0.duration_s * (cfg0.phase_runin_ratio + cfg0.phase_stable_ratio)))
+        invalid_ratio_pct0 = float(getattr(cfg0, "invalid_ratio", 0.0005)) * 100.0
 
         # 阶段比例（%）
         phase_runin_pct0 = float(cfg0.phase_runin_ratio) * 100.0
@@ -807,8 +1005,16 @@ class App(tk.Tk):
         phase_severe_pct0 = float(cfg0.phase_severe_ratio) * 100.0
 
         dur_h0 = float(cfg0.duration_s) / 3600.0
+        factory_export_items = [
+            ("phase_control_mode", "阶段控制方式：ratio 或 runin_tlife", str(phase_control_mode0)),
+            ("runin_ratio_by_tlife_pct", "磨合比例 + tlife 控制的磨合段比例（%）", f"{runin_ratio_by_tlife_pct0:.6f}"),
+            ("target_tlife_s", "磨合比例 + tlife 控制的目标 tlife（s）", f"{target_tlife_s0:.6f}"),
+            ("invalid_ratio_pct", "invalid 比例（%，quality flag=0）", f"{invalid_ratio_pct0:.6f}"),
+            ("data_export_format", "数据导出格式：xlsx 或 db(SQLite)", str(data_export_format0)),
+            ("data_export_columns", "数据导出列（逗号分隔）", str(data_export_columns0)),
+        ]
 
-        items = [
+        items = factory_export_items + [
             ("out_dir", "输出目录（导出 xlsx/图片/summary 的根目录）", str(out_dir0)),
             ("seed", "随机种子（保证仿真可重复）", str(seed0)),
             ("plot_lang", "导出图片语言：zh=中文，en=英文", str(plot_lang0)),
@@ -996,6 +1202,22 @@ class App(tk.Tk):
             self.cfg.phase_severe_ratio = float(self.phase_severe_pct.get()) / 100.0
         except Exception:
             pass
+        try:
+            self.cfg.phase_control_mode = str(self.phase_control_mode.get()).strip() or "ratio"
+        except Exception:
+            self.cfg.phase_control_mode = "ratio"
+        try:
+            self.cfg.runin_ratio_by_tlife = float(self.phase_runin_tlife_pct.get()) / 100.0
+        except Exception:
+            self.cfg.runin_ratio_by_tlife = float(getattr(self.cfg, "phase_runin_ratio", 0.12))
+        try:
+            self.cfg.target_tlife_s = float(self.target_tlife_s.get().strip())
+        except Exception:
+            self.cfg.target_tlife_s = float(getattr(self.cfg, "duration_s", 0.0) * max(0.0, getattr(self.cfg, "phase_runin_ratio", 0.12)))
+        try:
+            self.cfg.invalid_ratio = float(self.invalid_ratio_pct.get().strip()) / 100.0
+        except Exception:
+            self.cfg.invalid_ratio = 0.0005
 
         # 开环-闭环对比输出范围
         try:
@@ -1042,8 +1264,8 @@ class App(tk.Tk):
         self._cache_res = res
         return res
 
-    def _start_export_xlsx(self):
-        self._start_task(task="xlsx")
+    def _start_export_data(self):
+        self._start_task(task="data")
 
     def _start_export_plots(self):
         self._start_task(task="plots")
@@ -1063,12 +1285,21 @@ class App(tk.Tk):
             messagebox.showerror("输入错误", "请设置输出目录。")
             return
 
+        selected_columns = None
+        task_label = task
+        if task == "data":
+            selected_columns = self._get_selected_export_columns()
+            if not selected_columns:
+                messagebox.showerror("输入错误", "请至少勾选一列导出数据。")
+                return
+            task_label = f"data ({self.data_export_format.get()})"
+
         self.btn_xlsx.configure(state="disabled")
         self.btn_plots.configure(state="disabled")
         self.pb["value"] = 0.0
         self.pb_pct.set("0%")
         self.status.set("运行中…")
-        self._log(f"开始任务：导出 {task}\n")
+        self._log(f"开始任务：导出 {task_label}\n")
 
         def progress_cb(pct, msg):
             self.msg_q.put(("progress", float(pct), str(msg)))
@@ -1077,8 +1308,17 @@ class App(tk.Tk):
             try:
                 res = self._ensure_simulated(progress_cb, prepare_plot=(task == "plots"))
                 outputs = {}
-                if task == "xlsx":
-                    outputs["xlsx"] = export_xlsx(res, out_dir=out_dir, progress_cb=progress_cb)
+                if task == "data":
+                    fmt = str(self.data_export_format.get()).strip().lower() or "xlsx"
+                    if fmt == "sqlite":
+                        fmt = "db"
+                    outputs[fmt] = export_data(
+                        res,
+                        out_dir=out_dir,
+                        export_format=fmt,
+                        selected_columns=selected_columns,
+                        progress_cb=progress_cb,
+                    )
                 elif task == "plots":
                     outputs.update(export_plots(
                         res,
@@ -1088,7 +1328,7 @@ class App(tk.Tk):
                         font_prepared=True,
                     ))
                 export_summary(res, out_dir=out_dir, extra={"outputs": outputs})
-                self.msg_q.put(("done", task))
+                self.msg_q.put(("done", task_label))
             except Exception as e:
                 self.msg_q.put(("err", str(e)))
 

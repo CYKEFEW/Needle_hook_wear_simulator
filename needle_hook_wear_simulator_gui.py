@@ -24,6 +24,7 @@ needle_hook_wear_simulator_gui.py
 import os
 import json
 import math
+import sqlite3
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, Callable, List, Tuple
 
@@ -42,6 +43,73 @@ except Exception:
     HAVE_SCIPY = False
 
 ProgressCB = Optional[Callable[[float, str], None]]  # cb(pct 0~100, msg)
+
+DATA_EXPORT_FORMATS = ("xlsx", "db")
+
+EXPORT_COLUMN_SPECS: List[Tuple[str, str]] = [
+    ("t_s", "时间"),
+    ("t_high_N", "高张力"),
+    ("t_low_N", "低张力"),
+    ("t_avg_N", "平均张力"),
+    ("f_fric_N", "摩擦力"),
+    ("mu", "摩擦系数μ"),
+    ("quality_flag", "质量标志"),
+    ("mu_runin_start_used", "磨合段起始摩擦系数"),
+    ("mu_stable_used", "稳定段摩擦系数"),
+    ("mu_severe_end_used", "加速段末端摩擦系数"),
+    ("phase_runin_ratio", "磨合段比例"),
+    ("phase_stable_ratio", "稳定段比例"),
+    ("phase_severe_ratio", "加速段比例"),
+    ("mu_raw", "原始摩擦系数"),
+    ("mu_hampel", "Hampel 去毛刺摩擦系数（仅闭环）"),
+    ("mu_notch", "陷波后摩擦系数（仅闭环）"),
+    ("mu_filt", "低通后摩擦系数（仅闭环）"),
+    ("q_valid", "有效标记"),
+    ("rpm", "转速"),
+    ("mech_freq_hz", "机械主频"),
+    ("notch_q_used", "陷波 Q"),
+    ("theta_deg", "包角"),
+    ("t_set_N", "设定张力"),
+]
+
+EXPORT_COLUMN_LABELS: Dict[str, str] = dict(EXPORT_COLUMN_SPECS)
+DEFAULT_EXPORT_COLUMNS: Tuple[str, ...] = (
+    "t_s",
+    "t_high_N",
+    "t_low_N",
+    "t_avg_N",
+    "f_fric_N",
+    "mu",
+    "quality_flag",
+)
+
+EXPORT_COLUMN_NOTES: Dict[str, str] = {
+    "t_s": "t_s（时间 s）",
+    "t_high_N": "t_high_N（高张力 N）",
+    "t_low_N": "t_low_N（低张力 N）",
+    "t_avg_N": "t_avg_N（平均张力 N）",
+    "f_fric_N": "f_fric_N（摩擦力 N）",
+    "mu": "mu（摩擦系数μ）",
+    "quality_flag": "quality_flag（质量标志 / quality flag）",
+    "mu_runin_start_used": "mu_runin_start_used（磨合段起始摩擦系数）",
+    "mu_stable_used": "mu_stable_used（稳定段摩擦系数）",
+    "mu_severe_end_used": "mu_severe_end_used（加速段末端摩擦系数）",
+    "phase_runin_ratio": "phase_runin_ratio（磨合段比例）",
+    "phase_stable_ratio": "phase_stable_ratio（稳定段比例）",
+    "phase_severe_ratio": "phase_severe_ratio（加速段比例）",
+    "mu_raw": "mu_raw（原始摩擦系数）",
+    "mu_hampel": "mu_hampel（Hampel 去毛刺摩擦系数）",
+    "mu_notch": "mu_notch（陷波后摩擦系数）",
+    "mu_filt": "mu_filt（低通后摩擦系数）",
+    "q_valid": "q_valid（有效标记）",
+    "rpm": "rpm（转速 rpm）",
+    "mech_freq_hz": "mech_freq_hz（机械主频 Hz）",
+    "notch_q_used": "notch_q_used（陷波 Q）",
+    "theta_deg": "theta_deg（包角 deg）",
+    "t_set_N": "t_set_N（设定张力 N）",
+    "t_avg_open_N": "t_avg_open_N（开环平均张力 N）",
+    "t_avg_closed_N": "t_avg_closed_N（闭环平均张力 N）",
+}
 
 
 def _ensure_dir(p: str) -> None:
@@ -448,6 +516,9 @@ class SimConfig:
     phase_runin_ratio: float = 0.12
     phase_stable_ratio: float = 0.70
     phase_severe_ratio: float = 0.18
+    phase_control_mode: str = "ratio"  # ratio / runin_tlife
+    runin_ratio_by_tlife: float = 0.12
+    target_tlife_s: float = 29520.0
 
     # 三阶段摩擦系数范围（用于生成 μ(t) 真值；同一 seed 下可重复）
     # - 若 min==max，则等效为固定值
@@ -540,6 +611,7 @@ class SimConfig:
     stable_valid_min: float = 0.9
     fail_delta: float = 0.25
     fail_hold_s: float = 300.0
+    invalid_ratio: float = 0.0005
 
     # 导出/绘图
     export_stride: int = 1
@@ -577,17 +649,41 @@ class SimConfig:
         # 转速慢变时间常数
         self.tau_rpm_s = float(max(0.0, getattr(self, "tau_rpm_s", 0.0)))
 
-        # 阶段比例归一化
-        r1 = max(0.0, float(self.phase_runin_ratio))
-        r2 = max(0.0, float(self.phase_stable_ratio))
-        r3 = max(0.0, float(self.phase_severe_ratio))
-        s = r1 + r2 + r3
-        if s <= 1e-9:
-            r1, r2, r3 = 0.12, 0.70, 0.18
+        # 阶段控制模式与比例
+        mode = str(getattr(self, "phase_control_mode", "ratio")).strip().lower()
+        if mode not in ("ratio", "runin_tlife"):
+            mode = "ratio"
+        self.phase_control_mode = mode
+
+        if mode == "runin_tlife":
+            runin = float(max(0.0, min(1.0, getattr(self, "runin_ratio_by_tlife", self.phase_runin_ratio))))
+            target_tlife = float(getattr(self, "target_tlife_s", self.duration_s * max(runin, 0.0)))
+            min_tlife = min(float(self.duration_s), runin * float(self.duration_s) + 1.0 / max(1e-9, float(self.fs_Hz)))
+            max_tlife = float(max(min_tlife, self.duration_s - 1.0 / max(1e-9, float(self.fs_Hz))))
+            target_tlife = float(max(min_tlife, min(max_tlife, target_tlife)))
+            severe_start_ratio = float(max(runin + 1e-6, min(0.999999, target_tlife / max(1e-9, float(self.duration_s)))))
+            r1 = runin
+            r2 = max(0.0, severe_start_ratio - r1)
+            r3 = max(0.0, 1.0 - r1 - r2)
+            s = max(1e-9, r1 + r2 + r3)
+            self.phase_runin_ratio = r1 / s
+            self.phase_stable_ratio = r2 / s
+            self.phase_severe_ratio = r3 / s
+            self.runin_ratio_by_tlife = float(self.phase_runin_ratio)
+            self.target_tlife_s = target_tlife
+        else:
+            r1 = max(0.0, float(self.phase_runin_ratio))
+            r2 = max(0.0, float(self.phase_stable_ratio))
+            r3 = max(0.0, float(self.phase_severe_ratio))
             s = r1 + r2 + r3
-        self.phase_runin_ratio = r1 / s
-        self.phase_stable_ratio = r2 / s
-        self.phase_severe_ratio = r3 / s
+            if s <= 1e-9:
+                r1, r2, r3 = 0.12, 0.70, 0.18
+                s = r1 + r2 + r3
+            self.phase_runin_ratio = r1 / s
+            self.phase_stable_ratio = r2 / s
+            self.phase_severe_ratio = r3 / s
+            self.runin_ratio_by_tlife = float(max(0.0, min(1.0, getattr(self, "runin_ratio_by_tlife", self.phase_runin_ratio))))
+            self.target_tlife_s = float(max(0.0, min(self.duration_s, getattr(self, "target_tlife_s", self.duration_s * (self.phase_runin_ratio + self.phase_stable_ratio)))))
 
         # 兼容旧边界字段（用于旧逻辑/输出）
         self.runin_ratio = float(self.phase_runin_ratio)
@@ -602,13 +698,18 @@ class SimConfig:
         # 开环-闭环对比输出范围保护
         self.compare_t_start_s = float(max(0.0, self.compare_t_start_s))
         if float(self.compare_t_end_s) != -1.0:
-            self.compare_t_end_s = float(max(self.compare_t_start_s, self.compare_t_end_s))        # 连续稳定段最短时长（s）
-        self.stable_hold_s = float(max(0.0, self.stable_hold_s))        # 兼容旧版本：若 stable_slope_max 非常小（<1e-3），通常表示“斜率阈值(1/s)”，自动换算为总漂移量阈值
+            self.compare_t_end_s = float(max(self.compare_t_start_s, self.compare_t_end_s))
+
+        # 连续稳定段最短时长（s）
+        self.stable_hold_s = float(max(0.0, self.stable_hold_s))
+
+        # 兼容旧版本：若 stable_slope_max 非常小（<1e-3），通常表示“斜率阈值(1/s)”，自动换算为总漂移量阈值
         # Δμ_max ≈ g_max * Wss
         if float(self.stable_slope_max) < 1e-3:
             self.stable_slope_max = float(self.stable_slope_max) * float(self.stable_win_s)
         # 最小下限保护
         self.stable_slope_max = float(max(0.0, self.stable_slope_max))
+        self.invalid_ratio = float(max(0.0, min(0.49, getattr(self, "invalid_ratio", 0.0005))))
         # 扰动范围参数：确保 min<=max，且不为负
         def _clamp_range(a: float, b: float, lo: float = 0.0, hi: float = 1e9):
             a = float(max(lo, min(hi, a)))
@@ -1047,6 +1148,72 @@ def _invert_mu_from_tensions(t_high: np.ndarray, t_low: np.ndarray, cfg: SimConf
     return mu, q.astype(int)
 
 
+def _make_quality_flag(n: int, invalid_ratio: float, rng: np.random.Generator) -> np.ndarray:
+    flag = np.ones(max(0, int(n)), dtype=int)
+    if n <= 2:
+        return flag
+
+    count = int(round(float(invalid_ratio) * float(n)))
+    max_count = max(0, (n - 2 + 1) // 2)
+    count = max(0, min(count, max_count))
+    if count <= 0:
+        return flag
+
+    available = np.ones(n, dtype=bool)
+    available[0] = False
+    available[-1] = False
+    edges = np.linspace(1, n - 1, count + 1)
+    picked: List[int] = []
+
+    for k in range(count):
+        lo = max(1, int(math.floor(edges[k])))
+        hi = min(n - 2, int(math.ceil(edges[k + 1])) - 1)
+        if hi < lo:
+            hi = lo
+        candidates = [i for i in range(lo, hi + 1) if available[i]]
+        if not candidates:
+            candidates = [i for i in range(1, n - 1) if available[i]]
+        if not candidates:
+            break
+        idx = int(rng.choice(np.asarray(candidates, dtype=int)))
+        picked.append(idx)
+        available[idx] = False
+        if idx - 1 >= 1:
+            available[idx - 1] = False
+        if idx + 1 <= n - 2:
+            available[idx + 1] = False
+
+    if picked:
+        flag[np.asarray(sorted(picked), dtype=int)] = 0
+    return flag
+
+
+def _interpolate_invalid_values(x: np.ndarray, quality_flag: np.ndarray) -> np.ndarray:
+    arr = np.asarray(x, dtype=float).copy()
+    flag = np.asarray(quality_flag, dtype=int)
+    invalid_idx = np.flatnonzero(flag == 0)
+    if invalid_idx.size == 0:
+        return arr
+
+    n = len(arr)
+    valid_mask = (flag != 0) & np.isfinite(arr)
+    for idx in invalid_idx:
+        left = idx - 1
+        while left >= 0 and not valid_mask[left]:
+            left -= 1
+        right = idx + 1
+        while right < n and not valid_mask[right]:
+            right += 1
+
+        if left >= 0 and right < n:
+            arr[idx] = 0.5 * (arr[left] + arr[right])
+        elif left >= 0:
+            arr[idx] = arr[left]
+        elif right < n:
+            arr[idx] = arr[right]
+    return arr
+
+
 def _find_stable_baseline(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, cfg: SimConfig, end_idx: int = None):
     """
     稳定段基线 μss（按你的新规则）：
@@ -1145,28 +1312,36 @@ def _find_stable_segments(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, 
     return segs
 
 
-def _find_failure_time(mu_f: np.ndarray, t: np.ndarray, mu_ss: Optional[float], cfg: SimConfig, start_idx: int = 0):
+def _find_failure_time(
+    mu_f: np.ndarray,
+    t: np.ndarray,
+    q_valid: np.ndarray,
+    mu_ss: Optional[float],
+    cfg: SimConfig,
+    start_idx: int = 0,
+):
     """寿命判据：μ 持续超过 μth=μss*(1+δ) 持续 Wpersist，输出 tlife"""
     if mu_ss is None or not np.isfinite(mu_ss):
         return None, None
     mu_th = float(mu_ss * (1.0 + cfg.fail_delta))
-    hold = int(round(cfg.fail_hold_s * cfg.fs_Hz))
-    hold = max(1, hold)
+    hold_s = float(max(0.0, cfg.fail_hold_s))
+    dt = 1.0 / max(1e-9, float(cfg.fs_Hz))
 
     # 关键修复：失效判定从 start_idx 开始（通常取稳定段基线窗口结束），避免磨合段 μ 偏高导致 tlife=0s
     start_idx = int(max(0, min(len(mu_f) - 1, start_idx)))
 
-    above = np.isfinite(mu_f) & (mu_f > mu_th)
-    count = 0
-    for i in range(start_idx, len(above)):
-        a = bool(above[i])
-        if a:
-            count += 1
-            if count >= hold:
-                tlife = float(t[i - hold + 1])
-                return tlife, mu_th
+    run_start = None
+    for i in range(start_idx, len(mu_f)):
+        if not bool(q_valid[i]):
+            continue
+        above = bool(np.isfinite(mu_f[i]) and (mu_f[i] > mu_th))
+        if above:
+            if run_start is None:
+                run_start = i
+            if float(t[i] - t[run_start] + dt) >= hold_s:
+                return float(t[run_start]), mu_th
         else:
-            count = 0
+            run_start = None
     return None, mu_th
 
 
@@ -1197,6 +1372,9 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     _cb(progress_cb, 30.0, "Capstan 反演 μ_raw...")
     mu_open_raw, q_open = _invert_mu_from_tensions(th_open, tl_open, cfg)
     mu_cl_raw, q_cl = _invert_mu_from_tensions(th_cl, tl_cl, cfg)
+    quality_flag = _make_quality_flag(len(t), cfg.invalid_ratio, rng)
+    q_open_eff = (q_open.astype(int) * quality_flag.astype(int)).astype(int)
+    q_cl_eff = (q_cl.astype(int) * quality_flag.astype(int)).astype(int)
 
     _cb(progress_cb, 36.0, "μ 异常点剔除（Hampel）...")
     hampel_win = int(round(cfg.hampel_win_s * cfg.fs_Hz))
@@ -1229,17 +1407,36 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     _cb(progress_cb, 44.0, "μ 低通滤波...")
     mu_cl_lp = _lowpass(mu_cl_notch, fs=cfg.fs_Hz, fc=cfg.lowpass_fc_hz, order=3).astype(float)
     mu_cl_lp[q_cl == 0] = np.nan
+    mu_cl_lp_eval = mu_cl_lp.copy()
+
+    mu_true_disp = _interpolate_invalid_values(mu_true, quality_flag)
+    tavg_open_disp = _interpolate_invalid_values(tavg_open, quality_flag)
+    tavg_closed_disp = _interpolate_invalid_values(tavg_closed, quality_flag)
+    th_open_disp = _interpolate_invalid_values(th_open, quality_flag)
+    tl_open_disp = _interpolate_invalid_values(tl_open, quality_flag)
+    th_cl_disp = _interpolate_invalid_values(th_cl, quality_flag)
+    tl_cl_disp = _interpolate_invalid_values(tl_cl, quality_flag)
+    ff_open_disp = _interpolate_invalid_values(ff_open, quality_flag)
+    ff_cl_disp = _interpolate_invalid_values(ff_cl, quality_flag)
+    mu_open_raw_disp = _interpolate_invalid_values(mu_open_raw, quality_flag)
+    mu_cl_raw_disp = _interpolate_invalid_values(mu_cl_raw, quality_flag)
+    mu_cl_h_disp = _interpolate_invalid_values(mu_cl_h, quality_flag)
+    mu_cl_notch_disp = _interpolate_invalid_values(mu_cl_notch, quality_flag)
+    mu_cl_lp_disp = _interpolate_invalid_values(mu_cl_lp, quality_flag)
+    rpm_t_disp = _interpolate_invalid_values(rpm_t, quality_flag)
+    f_mech_t_disp = _interpolate_invalid_values(f_mech_t, quality_flag)
+    q_notch_t_disp = _interpolate_invalid_values(q_notch_t, quality_flag)
 
     _cb(progress_cb, 48.0, "稳定段基线与寿命判据计算...")
     # 1) 先识别“全时域”的连续稳定段（用于可视化）；绘图时再裁剪 tlife 右侧
-    stable_segs_all = _find_stable_segments(mu_cl_lp, t, q_cl, cfg, end_idx=None)
+    stable_segs_all = _find_stable_segments(mu_cl_lp_eval, t, q_cl_eff, cfg, end_idx=None)
 
     # 2) 先在全时域寻找稳定段基线 μss（得到稳定窗口 stable_idx0）
-    stable_idx0, mu_ss0 = _find_stable_baseline(mu_cl_lp, t, q_cl, cfg, end_idx=None)
+    stable_idx0, mu_ss0 = _find_stable_baseline(mu_cl_lp_eval, t, q_cl_eff, cfg, end_idx=None)
 
     # 3) 初步计算 tlife（从稳定窗口结束开始判定，避免磨合段 μ 偏高导致 tlife=0s）
     start_fail_idx0 = int(stable_idx0[1]) if (stable_idx0 is not None) else 0
-    tlife0, mu_th0 = _find_failure_time(mu_cl_lp, t, mu_ss0, cfg, start_idx=start_fail_idx0)
+    tlife0, mu_th0 = _find_failure_time(mu_cl_lp_eval, t, q_cl_eff, mu_ss0, cfg, start_idx=start_fail_idx0)
 
     # 4) 若存在 tlife0，则优先在 tlife0 之前重算 μss（更符合“失效前基线”意义）；否则沿用全时域
     tlife = tlife0
@@ -1247,7 +1444,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     tlife_idx = None
     if tlife0 is not None:
         tlife_idx = int(max(1, min(len(t), int(round(float(tlife0) * cfg.fs_Hz)) + 1)))
-        stable_idx, mu_ss = _find_stable_baseline(mu_cl_lp, t, q_cl, cfg, end_idx=tlife_idx)
+        stable_idx, mu_ss = _find_stable_baseline(mu_cl_lp_eval, t, q_cl_eff, cfg, end_idx=tlife_idx)
         if mu_ss is None or not np.isfinite(mu_ss):
             stable_idx, mu_ss = stable_idx0, mu_ss0
     else:
@@ -1256,7 +1453,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     # 5) 用最终 μss 重新计算 tlife 与 μth（同样从稳定窗口结束开始）
     if mu_ss is not None and np.isfinite(mu_ss):
         start_fail_idx = int(stable_idx[1]) if (stable_idx is not None) else 0
-        tlife, mu_th = _find_failure_time(mu_cl_lp, t, mu_ss, cfg, start_idx=start_fail_idx)
+        tlife, mu_th = _find_failure_time(mu_cl_lp_eval, t, q_cl_eff, mu_ss, cfg, start_idx=start_fail_idx)
         if tlife is not None:
             tlife_idx = int(max(1, min(len(t), int(round(float(tlife) * cfg.fs_Hz)) + 1)))
 
@@ -1277,17 +1474,22 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
             "phase_runin_ratio_used": float(cfg.phase_runin_ratio),
             "phase_stable_ratio_used": float(cfg.phase_stable_ratio),
             "phase_severe_ratio_used": float(cfg.phase_severe_ratio),
+            "phase_control_mode_used": str(cfg.phase_control_mode),
+            "runin_ratio_by_tlife_used": float(cfg.runin_ratio_by_tlife),
+            "target_tlife_s_used": float(cfg.target_tlife_s),
+            "invalid_ratio_used": float(cfg.invalid_ratio),
         },
         "series": {
             "t": t,
-            "mu_true": mu_true,
-            "rpm_t": rpm_t,
-            "f_mech_t": f_mech_t,
-            "q_notch_t": q_notch_t,
-            "open": {"tavg": tavg_open, "th": th_open, "tl": tl_open, "ff": ff_open, "mu_raw": mu_open_raw, "q": q_open},
+            "mu_true": mu_true_disp,
+            "quality_flag": quality_flag.astype(int),
+            "rpm_t": rpm_t_disp,
+            "f_mech_t": f_mech_t_disp,
+            "q_notch_t": q_notch_t_disp,
+            "open": {"tavg": tavg_open_disp, "th": th_open_disp, "tl": tl_open_disp, "ff": ff_open_disp, "mu_raw": mu_open_raw_disp, "q": q_open_eff},
             "closed": {
-                "tavg": tavg_closed, "th": th_cl, "tl": tl_cl, "ff": ff_cl,
-                "mu_raw": mu_cl_raw, "mu_hampel": mu_cl_h, "mu_notch": mu_cl_notch, "mu_filt": mu_cl_lp, "q": q_cl
+                "tavg": tavg_closed_disp, "th": th_cl_disp, "tl": tl_cl_disp, "ff": ff_cl_disp,
+                "mu_raw": mu_cl_raw_disp, "mu_hampel": mu_cl_h_disp, "mu_notch": mu_cl_notch_disp, "mu_filt": mu_cl_lp_disp, "q": q_cl_eff
             },
         },
         "baseline": {"stable_window_idx": stable_idx, "stable_segments_idx": stable_segs, "mu_ss": mu_ss, "tlife_idx": tlife_idx},
@@ -1321,6 +1523,9 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
         f_mech_t = (rpm_t / 60.0) * float(max(1, cfg.mech_harmonic))
     if q_notch_t is None:
         q_notch_t = np.full_like(t, q_notch, dtype=float)
+    quality_flag = res["series"].get("quality_flag")
+    if quality_flag is None:
+        quality_flag = np.ones_like(t, dtype=int)
 
     cl = res["series"]["closed"]
     op = res["series"]["open"]
@@ -1436,6 +1641,238 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
     )
     _cb(progress_cb, 100.0, "xlsx 导出完成")
     return xlsx_path
+
+
+def _normalize_export_columns(selected_columns: Optional[List[str]] = None) -> List[str]:
+    if selected_columns is None:
+        return [name for name, _ in EXPORT_COLUMN_SPECS]
+
+    normalized: List[str] = []
+    seen = set()
+    for name in selected_columns:
+        key = str(name).strip()
+        if (not key) or (key in seen) or (key not in EXPORT_COLUMN_LABELS):
+            continue
+        seen.add(key)
+        normalized.append(key)
+
+    if not normalized:
+        raise ValueError("至少需要选择一列导出数据。")
+    return normalized
+
+
+def _build_data_export_tables(
+    res: Dict[str, Any],
+    selected_columns: Optional[List[str]] = None,
+) -> Dict[str, pd.DataFrame]:
+    cfg: SimConfig = res["cfg"]
+    t = res["series"]["t"]
+    stride = int(cfg.export_stride)
+    t_e = t[::stride]
+
+    def ds(x):
+        return x[::stride]
+
+    def fill_const(value: float) -> np.ndarray:
+        return np.full_like(t_e, float(value), dtype=float)
+
+    def fill_nan() -> np.ndarray:
+        return np.full_like(t_e, np.nan, dtype=float)
+
+    q_notch = float(res["derived"]["notch_q_used"])
+    rpm_t = res["series"].get("rpm_t")
+    f_mech_t = res["series"].get("f_mech_t")
+    q_notch_t = res["series"].get("q_notch_t")
+    if rpm_t is None:
+        rpm_t = np.full_like(t, float(cfg.rpm_used()), dtype=float)
+    if f_mech_t is None:
+        f_mech_t = (rpm_t / 60.0) * float(max(1, cfg.mech_harmonic))
+    if q_notch_t is None:
+        q_notch_t = np.full_like(t, q_notch, dtype=float)
+    quality_flag = res["series"].get("quality_flag")
+    if quality_flag is None:
+        quality_flag = np.ones_like(t, dtype=int)
+
+    cl = res["series"]["closed"]
+    op = res["series"]["open"]
+    selected = _normalize_export_columns(selected_columns)
+
+    closed_df = pd.DataFrame({
+        "t_s": t_e,
+        "t_high_N": ds(cl["th"]),
+        "t_low_N": ds(cl["tl"]),
+        "t_avg_N": ds(cl["tavg"]),
+        "f_fric_N": ds(cl["ff"]),
+        "mu": ds(res["series"]["mu_true"]),
+        "quality_flag": ds(quality_flag).astype(int),
+        "mu_runin_start_used": fill_const(res["derived"].get("mu_runin_start_used", np.nan)),
+        "mu_stable_used": fill_const(res["derived"].get("mu_stable_used", np.nan)),
+        "mu_severe_end_used": fill_const(res["derived"].get("mu_severe_end_used", np.nan)),
+        "phase_runin_ratio": fill_const(res["derived"].get("phase_runin_ratio_used", np.nan)),
+        "phase_stable_ratio": fill_const(res["derived"].get("phase_stable_ratio_used", np.nan)),
+        "phase_severe_ratio": fill_const(res["derived"].get("phase_severe_ratio_used", np.nan)),
+        "mu_raw": ds(cl["mu_raw"]),
+        "mu_hampel": ds(cl["mu_hampel"]),
+        "mu_notch": ds(cl["mu_notch"]),
+        "mu_filt": ds(cl["mu_filt"]),
+        "q_valid": ds(cl["q"]).astype(int),
+        "rpm": ds(rpm_t),
+        "mech_freq_hz": ds(f_mech_t),
+        "notch_q_used": ds(q_notch_t),
+        "theta_deg": fill_const(cfg.theta_deg),
+        "t_set_N": fill_const(cfg.t_set_N),
+    })
+
+    open_df = pd.DataFrame({
+        "t_s": t_e,
+        "t_high_N": ds(op["th"]),
+        "t_low_N": ds(op["tl"]),
+        "t_avg_N": ds(op["tavg"]),
+        "f_fric_N": ds(op["ff"]),
+        "mu": ds(res["series"]["mu_true"]),
+        "quality_flag": ds(quality_flag).astype(int),
+        "mu_runin_start_used": fill_const(res["derived"].get("mu_runin_start_used", np.nan)),
+        "mu_stable_used": fill_const(res["derived"].get("mu_stable_used", np.nan)),
+        "mu_severe_end_used": fill_const(res["derived"].get("mu_severe_end_used", np.nan)),
+        "phase_runin_ratio": fill_const(res["derived"].get("phase_runin_ratio_used", np.nan)),
+        "phase_stable_ratio": fill_const(res["derived"].get("phase_stable_ratio_used", np.nan)),
+        "phase_severe_ratio": fill_const(res["derived"].get("phase_severe_ratio_used", np.nan)),
+        "mu_raw": ds(op["mu_raw"]),
+        "mu_hampel": fill_nan(),
+        "mu_notch": fill_nan(),
+        "mu_filt": fill_nan(),
+        "q_valid": ds(op["q"]).astype(int),
+        "rpm": ds(rpm_t),
+        "mech_freq_hz": ds(f_mech_t),
+        "notch_q_used": ds(q_notch_t),
+        "theta_deg": fill_const(cfg.theta_deg),
+        "t_set_N": fill_const(cfg.t_set_N),
+    })
+
+    closed_df = closed_df.loc[:, selected]
+    open_df = open_df.loc[:, selected]
+
+    t0_cmp = float(getattr(cfg, "compare_t_start_s", 0.0))
+    t1_cmp = float(getattr(cfg, "compare_t_end_s", -1.0))
+    if (t0_cmp == 0.0) and (t1_cmp < 0.0):
+        cmp_mask = np.ones_like(t_e, dtype=bool)
+    else:
+        if t1_cmp < 0.0:
+            t1_cmp = float(t_e[-1])
+        t0_cmp = max(0.0, t0_cmp)
+        t1_cmp = max(t0_cmp, t1_cmp)
+        cmp_mask = (t_e >= t0_cmp) & (t_e <= t1_cmp)
+        if int(cmp_mask.sum()) < 2:
+            cmp_mask = np.ones_like(t_e, dtype=bool)
+
+    compare_df = pd.DataFrame({
+        "t_s": t_e[cmp_mask],
+        "t_avg_open_N": ds(op["tavg"])[cmp_mask],
+        "t_avg_closed_N": ds(cl["tavg"])[cmp_mask],
+    })
+
+    return {
+        "closed_loop": closed_df,
+        "open_loop": open_df,
+        "compare_window": compare_df,
+    }
+
+
+def _annotate_export_tables(tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    return {
+        name: df.rename(columns=EXPORT_COLUMN_NOTES)
+        for name, df in tables.items()
+    }
+
+
+def _write_sqlite_tables(
+    db_path: str,
+    tables: Dict[str, pd.DataFrame],
+    progress_cb: ProgressCB = None,
+    base_pct: float = 55.0,
+    span_pct: float = 44.0,
+) -> None:
+    total_rows = sum(int(len(df)) for df in tables.values())
+    written = 0
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        for table_name, df in tables.items():
+            df.to_sql(table_name, conn, if_exists="replace", index=False)
+            written += int(len(df))
+            done = span_pct if total_rows <= 0 else span_pct * (written / total_rows)
+            _cb(
+                progress_cb,
+                min(99.0, base_pct + done),
+                f"写入数据库表：{table_name}（{written}/{total_rows} 行）",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _cb(progress_cb, min(99.0, base_pct + span_pct), "数据库写入结束")
+
+
+def export_data(
+    res: Dict[str, Any],
+    out_dir: str,
+    export_format: str = "xlsx",
+    selected_columns: Optional[List[str]] = None,
+    progress_cb: ProgressCB = None,
+) -> str:
+    """导出仿真数据，支持 xlsx 与 SQLite 数据库。"""
+    out_dir = os.path.abspath(out_dir)
+    _ensure_dir(out_dir)
+
+    fmt = str(export_format).strip().lower()
+    if fmt == "sqlite":
+        fmt = "db"
+    if fmt not in DATA_EXPORT_FORMATS:
+        raise ValueError(f"不支持的导出格式：{export_format}")
+
+    _cb(progress_cb, 52.0, "组织导出数据表...")
+    tables = _build_data_export_tables(res, selected_columns=selected_columns)
+
+    if fmt == "xlsx":
+        xlsx_path = os.path.join(out_dir, "needle_hook_wear_sim.xlsx")
+        _cb(progress_cb, 55.0, "开始写入 xlsx（多 sheet，必要时自动拆分）...")
+        _write_xlsx_multisheet(
+            xlsx_path,
+            _annotate_export_tables(tables),
+            progress_cb=progress_cb,
+            base_pct=55.0,
+            span_pct=44.0,
+        )
+        _cb(progress_cb, 100.0, "xlsx 导出完成")
+        return xlsx_path
+
+    db_path = os.path.join(out_dir, "needle_hook_wear_sim.db")
+    _cb(progress_cb, 55.0, "开始写入 SQLite 数据库...")
+    _write_sqlite_tables(
+        db_path,
+        tables,
+        progress_cb=progress_cb,
+        base_pct=55.0,
+        span_pct=44.0,
+    )
+    _cb(progress_cb, 100.0, "数据库导出完成")
+    return db_path
+
+
+def export_xlsx(
+    res: Dict[str, Any],
+    out_dir: str,
+    progress_cb: ProgressCB = None,
+    selected_columns: Optional[List[str]] = None,
+) -> str:
+    """导出 xlsx（多 sheet 自动拆分）。"""
+    return export_data(
+        res,
+        out_dir=out_dir,
+        export_format="xlsx",
+        selected_columns=selected_columns,
+        progress_cb=progress_cb,
+    )
 
 
 def _legend_below_center(ncol: int = 3):
