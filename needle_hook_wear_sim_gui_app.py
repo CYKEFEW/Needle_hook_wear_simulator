@@ -116,13 +116,13 @@ class App(tk.Tk):
 
         tab_core = ttk.Frame(nb, padding=10)
         tab_dist = ttk.Frame(nb, padding=10)
-        tab_phase = ttk.Frame(nb, padding=10)
+        tab_phase_host, tab_phase = self._create_scrollable_tab(nb, padding=10)
         tab_filter = ttk.Frame(nb, padding=10)
         tab_judge = ttk.Frame(nb, padding=10)
         tab_export = ttk.Frame(nb, padding=10)
         nb.add(tab_core, text="核心输入")
         nb.add(tab_dist, text="扰动参数")
-        nb.add(tab_phase, text="阶段比例/μ范围")
+        nb.add(tab_phase_host, text="阶段比例/μ范围")
         nb.add(tab_filter, text="滤波参数")
         nb.add(tab_judge, text="基线/阈值/寿命")
         nb.add(tab_export, text="导出/绘图")
@@ -305,6 +305,58 @@ class App(tk.Tk):
         ttk.Radiobutton(fmt_box, text="xlsx", variable=self.data_export_format, value="xlsx").pack(side="left", padx=(10, 0))
         ttk.Radiobutton(fmt_box, text="SQLite (.db)", variable=self.data_export_format, value="db").pack(side="left", padx=(10, 0))
         self._build_export_column_checks(tab_export, row=4)
+
+    def _create_scrollable_tab(self, notebook, padding=10):
+        host = ttk.Frame(notebook)
+        host.columnconfigure(0, weight=1)
+        host.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(host, highlightthickness=0, borderwidth=0)
+        ysb = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=ysb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+
+        body = ttk.Frame(canvas, padding=padding)
+        window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _sync_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _fit_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def _on_mousewheel(event):
+            if event.delta:
+                step = -int(event.delta / 120)
+            elif getattr(event, "num", None) == 4:
+                step = -1
+            elif getattr(event, "num", None) == 5:
+                step = 1
+            else:
+                step = 0
+            if step:
+                canvas.yview_scroll(step, "units")
+                return "break"
+            return None
+
+        def _bind_mousewheel(_event=None):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_mousewheel(_event=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        body.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _fit_width)
+        for widget in (canvas, body):
+            widget.bind("<Enter>", _bind_mousewheel, add="+")
+            widget.bind("<Leave>", _unbind_mousewheel, add="+")
+
+        return host, body
 
     def _add_entry(self, parent, label, field, row=None, is_int=False):
         if row is None:
