@@ -867,6 +867,7 @@ def _mu_profile(
     phase_runin_ratio: Optional[float] = None,
     phase_stable_ratio: Optional[float] = None,
     phase_severe_ratio: Optional[float] = None,
+    severe_duration_s: Optional[float] = None,
 ) -> np.ndarray:
     """
     μ(t) 真值：磨合 → 稳定 → 加速磨损（连续）
@@ -928,9 +929,12 @@ def _mu_profile(
         mu[idx2] = mu_st0 + (mu_st1 - mu_st0) * x
 
     # 3) 加速磨损：S型上升（归一化 sigmoid，保证起点=μst1，终点=μse）
-    idx3 = t > t_severe
+    dt = 1.0 / max(1e-9, float(cfg.fs_Hz))
+    t_severe_end = T if severe_duration_s is None else min(T, t_severe + max(dt, float(severe_duration_s)))
+
+    idx3 = (t > t_severe) & (t <= t_severe_end)
     if np.any(idx3):
-        span = max(1e-6, (T - t_severe))
+        span = max(1e-6, (t_severe_end - t_severe))
         x = (t[idx3] - t_severe) / span  # 0..1
         k_sa = float(max(0.05, getattr(cfg, 'trans_stable2severe_k', 1.0)))
         k = 10.0 * k_sa
@@ -940,6 +944,10 @@ def _mu_profile(
         den = max(1e-12, (s1 - s0))
         sn = (sig - s0) / den  # x=0 ->0, x=1 ->1
         mu[idx3] = mu_st1 + (mu_se - mu_st1) * sn
+
+    idx4 = t > t_severe_end
+    if np.any(idx4):
+        mu[idx4] = mu_se
 
     # 微弱高频成分（非机械主频）
     mu += 0.002 * np.sin(2 * np.pi * 0.2 * t)
@@ -1263,7 +1271,7 @@ def _make_sensor_noise_pair(
     return noise_high.astype(float), noise_low.astype(float)
 
 
-def _estimate_target_severe_start_time(
+def _estimate_target_severe_profile(
     cfg: SimConfig,
     total_time_s: float,
     t_runin_s: float,
@@ -1271,17 +1279,18 @@ def _estimate_target_severe_start_time(
     mu_stable: float,
     mu_severe_end: float,
     mu_ss_est: Optional[float] = None,
-) -> float:
+) -> Tuple[float, float]:
     dt = 1.0 / max(1e-9, float(cfg.fs_Hz))
     if total_time_s <= 0.0:
-        return 0.0
+        return 0.0, dt
 
     target_tlife_s = float(max(t_runin_s + dt, min(total_time_s - dt, target_tlife_s)))
     mu_st0 = float(np.clip(mu_stable, cfg.mu_stable_min, cfg.mu_stable_max))
     mu_st1 = float(np.clip(mu_st0 + 0.02, cfg.mu_stable_min, cfg.mu_stable_max))
     mu_se = float(np.clip(mu_severe_end, cfg.mu_severe_min, cfg.mu_severe_max))
     if mu_se <= mu_st1 + 1e-9:
-        return float(max(t_runin_s + dt, min(target_tlife_s - dt, 0.5 * (t_runin_s + target_tlife_s))))
+        t_severe = float(max(t_runin_s + dt, min(target_tlife_s - dt, 0.5 * (t_runin_s + target_tlife_s))))
+        return t_severe, float(max(dt, min(total_time_s - t_severe, 0.18 * total_time_s)))
 
     if mu_ss_est is None or (not np.isfinite(mu_ss_est)):
         mu_ss_est = 0.5 * (mu_st0 + mu_st1)
@@ -1299,8 +1308,13 @@ def _estimate_target_severe_start_time(
     x_cross = 0.5 + math.log(sig / (1.0 - sig)) / max(1e-9, k)
     x_cross = float(max(1e-4, min(0.9999, x_cross)))
 
-    t_severe = (target_tlife_s - x_cross * total_time_s) / max(1e-9, (1.0 - x_cross))
-    return float(max(t_runin_s + dt, min(target_tlife_s - dt, t_severe)))
+    default_severe_duration_s = float(max(dt * 2.0, min(0.18 * total_time_s, total_time_s - t_runin_s - dt)))
+    max_duration_from_target = float(max(dt * 2.0, (target_tlife_s - t_runin_s - dt) / max(1e-6, x_cross)))
+    severe_duration_s = float(min(default_severe_duration_s, max_duration_from_target))
+    t_severe = float(target_tlife_s - x_cross * severe_duration_s)
+    t_severe = float(max(t_runin_s + dt, min(target_tlife_s - dt, t_severe)))
+    severe_duration_s = float(max(dt * 2.0, min(severe_duration_s, total_time_s - t_severe)))
+    return t_severe, severe_duration_s
 
 
 def _find_stable_baseline(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, cfg: SimConfig, end_idx: int = None):
@@ -1467,6 +1481,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     def _run_candidate(
         phase_stable_ratio: float,
         phase_severe_ratio: float,
+        severe_duration_s: Optional[float] = None,
         emit_progress: bool = False,
     ) -> Dict[str, Any]:
         mu_true_local = _mu_profile(
@@ -1478,6 +1493,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
             phase_runin_ratio=cfg.phase_runin_ratio,
             phase_stable_ratio=phase_stable_ratio,
             phase_severe_ratio=phase_severe_ratio,
+            severe_duration_s=severe_duration_s,
         )
 
         if emit_progress:
@@ -1561,6 +1577,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
         return {
             "phase_stable_ratio_used": float(phase_stable_ratio),
             "phase_severe_ratio_used": float(phase_severe_ratio),
+            "severe_duration_s_used": None if severe_duration_s is None else float(severe_duration_s),
             "mu_true": mu_true_local,
             "th_open": th_open_local,
             "tl_open": tl_open_local,
@@ -1588,7 +1605,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
         total_time_s = float(t[-1]) if len(t) else 0.0
         target_tlife_s = float(max(0.0, min(total_time_s, float(getattr(cfg, "target_tlife_s", total_time_s)))))
         t_runin_s = float(cfg.phase_runin_ratio) * total_time_s
-        guess_t_severe = _estimate_target_severe_start_time(
+        guess_t_severe, severe_duration_s = _estimate_target_severe_profile(
             cfg,
             total_time_s=total_time_s,
             t_runin_s=t_runin_s,
@@ -1596,37 +1613,11 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
             mu_stable=mu_stable_used,
             mu_severe_end=mu_severe_end_used,
         )
-        prev_guess_t = None
-        prev_tlife_scan = None
-        final_stable_ratio = float(cfg.phase_stable_ratio)
-        final_severe_ratio = float(cfg.phase_severe_ratio)
-        for _ in range(3):
-            severe_start_ratio = float(max(cfg.phase_runin_ratio + 1e-6, min(0.999999, guess_t_severe / max(1e-9, total_time_s))))
-            stable_ratio_try = max(0.0, severe_start_ratio - float(cfg.phase_runin_ratio))
-            severe_ratio_try = max(0.0, 1.0 - float(cfg.phase_runin_ratio) - stable_ratio_try)
-            cand_try = _run_candidate(stable_ratio_try, severe_ratio_try, emit_progress=False)
-            final_stable_ratio = stable_ratio_try
-            final_severe_ratio = severe_ratio_try
-
-            tlife_scan = cand_try["tlife_scan"]
-            if tlife_scan is not None and abs(float(tlife_scan) - target_tlife_s) <= dt:
-                break
-
-            if tlife_scan is None:
-                next_guess_t = guess_t_severe - max(dt, 0.20 * max(dt, target_tlife_s - t_runin_s))
-            elif prev_guess_t is not None and prev_tlife_scan is not None and abs(float(tlife_scan) - float(prev_tlife_scan)) > 1e-9:
-                next_guess_t = guess_t_severe + (target_tlife_s - float(tlife_scan)) * (guess_t_severe - prev_guess_t) / (float(tlife_scan) - float(prev_tlife_scan))
-            else:
-                next_guess_t = guess_t_severe - (float(tlife_scan) - target_tlife_s)
-
-            prev_guess_t = guess_t_severe
-            prev_tlife_scan = tlife_scan
-            guess_t_severe = float(max(t_runin_s + dt, min(target_tlife_s - dt, next_guess_t)))
-
-        cfg.phase_stable_ratio = float(final_stable_ratio)
-        cfg.phase_severe_ratio = float(final_severe_ratio)
+        severe_start_ratio = float(max(cfg.phase_runin_ratio + 1e-6, min(0.999999, guess_t_severe / max(1e-9, total_time_s))))
+        cfg.phase_stable_ratio = float(max(0.0, severe_start_ratio - float(cfg.phase_runin_ratio)))
+        cfg.phase_severe_ratio = float(max(0.0, 1.0 - float(cfg.phase_runin_ratio) - float(cfg.phase_stable_ratio)))
         cfg.severe_start_ratio = float(cfg.phase_runin_ratio + cfg.phase_stable_ratio)
-        candidate = _run_candidate(cfg.phase_stable_ratio, cfg.phase_severe_ratio, emit_progress=True)
+        candidate = _run_candidate(cfg.phase_stable_ratio, cfg.phase_severe_ratio, severe_duration_s=severe_duration_s, emit_progress=True)
     else:
         candidate = _run_candidate(cfg.phase_stable_ratio, cfg.phase_severe_ratio, emit_progress=True)
 
