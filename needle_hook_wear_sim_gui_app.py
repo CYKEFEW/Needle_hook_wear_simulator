@@ -31,6 +31,8 @@ from needle_hook_wear_simulator_gui import (
     HAVE_SCIPY,
     EXPORT_COLUMN_SPECS,
     DEFAULT_EXPORT_COLUMNS,
+    EXPORT_TABLE_SPECS,
+    DEFAULT_EXPORT_TABLES,
 )
 
 
@@ -62,6 +64,10 @@ class App(tk.Tk):
         self.export_column_vars = {
             key: tk.BooleanVar(value=(key in DEFAULT_EXPORT_COLUMNS))
             for key, _ in EXPORT_COLUMN_SPECS
+        }
+        self.export_table_vars = {
+            key: tk.BooleanVar(value=(key in DEFAULT_EXPORT_TABLES))
+            for key, _ in EXPORT_TABLE_SPECS
         }
         self.invalid_ratio_pct = tk.StringVar(value=f"{float(getattr(self.cfg, 'invalid_ratio', 0.0005)) * 100.0:.6g}")
         self.phase_control_mode = tk.StringVar(value=str(getattr(self.cfg, "phase_control_mode", "ratio")))
@@ -304,7 +310,8 @@ class App(tk.Tk):
         ttk.Label(fmt_box, text="数据导出格式").pack(side="left")
         ttk.Radiobutton(fmt_box, text="xlsx", variable=self.data_export_format, value="xlsx").pack(side="left", padx=(10, 0))
         ttk.Radiobutton(fmt_box, text="SQLite (.db)", variable=self.data_export_format, value="db").pack(side="left", padx=(10, 0))
-        self._build_export_column_checks(tab_export, row=4)
+        self._build_export_table_checks(tab_export, row=4)
+        self._build_export_column_checks(tab_export, row=5)
 
     def _create_scrollable_tab(self, notebook, padding=10):
         host = ttk.Frame(notebook)
@@ -394,8 +401,18 @@ class App(tk.Tk):
             if self.export_column_vars[key].get()
         ]
 
+    def _get_selected_export_tables(self):
+        return [
+            key
+            for key, _ in EXPORT_TABLE_SPECS
+            if self.export_table_vars[key].get()
+        ]
+
     def _export_columns_to_ini_value(self):
         return ",".join(self._get_selected_export_columns())
+
+    def _export_tables_to_ini_value(self):
+        return ",".join(self._get_selected_export_tables())
 
     def _set_export_columns_from_csv(self, raw_value):
         raw = str(raw_value or "").strip()
@@ -406,6 +423,31 @@ class App(tk.Tk):
         selected_set = set(selected)
         for key, _ in EXPORT_COLUMN_SPECS:
             self.export_column_vars[key].set(key in selected_set)
+
+    def _set_export_tables_from_csv(self, raw_value):
+        raw = str(raw_value or "").strip()
+        tokens = {part.strip() for part in raw.split(",") if part.strip()}
+        selected = [key for key, _ in EXPORT_TABLE_SPECS if key in tokens]
+        if not selected:
+            selected = list(DEFAULT_EXPORT_TABLES)
+        selected_set = set(selected)
+        for key, _ in EXPORT_TABLE_SPECS:
+            self.export_table_vars[key].set(key in selected_set)
+
+    def _build_export_table_checks(self, parent, row):
+        box = ttk.LabelFrame(parent, text="数据导出表", padding=8)
+        box.grid(row=row, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        for col in range(2):
+            box.columnconfigure(col, weight=1)
+
+        for idx, (key, label) in enumerate(EXPORT_TABLE_SPECS):
+            r = idx // 2
+            c = idx % 2
+            ttk.Checkbutton(
+                box,
+                text=label,
+                variable=self.export_table_vars[key],
+            ).grid(row=r, column=c, sticky="w", padx=(0, 12), pady=2)
 
     def _build_export_column_checks(self, parent, row):
         box = ttk.LabelFrame(parent, text="数据导出列", padding=8)
@@ -462,7 +504,7 @@ class App(tk.Tk):
         stable_pct = max(0.0, (tlife_s / duration_s) * 100.0 - runin_pct)
         severe_pct = max(0.0, 100.0 - runin_pct - stable_pct)
         self.phase_tlife_info.set(
-            f"按当前 duration 推导：稳定≈{stable_pct:.2f}% / 加速≈{severe_pct:.2f}%；tlife≈{tlife_s:.2f}s"
+            f"按当前 duration 推导：稳定≈{stable_pct:.2f}% / 加速≈{severe_pct:.2f}%；tlife={tlife_s:.2f}s"
         )
 
     def _on_runin_tlife_change(self):
@@ -862,6 +904,7 @@ class App(tk.Tk):
             pass
         self.plot_lang.set(gs("plot_lang", self.plot_lang.get()))
         self.data_export_format.set(gs("data_export_format", self.data_export_format.get()))
+        self._set_export_tables_from_csv(gs("data_export_tables", self._export_tables_to_ini_value()))
         self._set_export_columns_from_csv(gs("data_export_columns", self._export_columns_to_ini_value()))
         self.invalid_ratio_pct.set(gs("invalid_ratio_pct", self.invalid_ratio_pct.get()))
         self.phase_control_mode.set(gs("phase_control_mode", self.phase_control_mode.get()))
@@ -946,6 +989,7 @@ class App(tk.Tk):
             ("target_tlife_s", "磨合比例 + tlife 控制的目标 tlife（s）", self.target_tlife_s.get()),
             ("invalid_ratio_pct", "invalid 比例（%，quality flag=0）", self.invalid_ratio_pct.get()),
             ("data_export_format", "数据导出格式：xlsx 或 db(SQLite)", self.data_export_format.get()),
+            ("data_export_tables", "数据导出表（逗号分隔）", self._export_tables_to_ini_value()),
             ("data_export_columns", "数据导出列（逗号分隔）", self._export_columns_to_ini_value()),
         ])
 
@@ -1042,6 +1086,7 @@ class App(tk.Tk):
         seed0 = 7
         plot_lang0 = "zh"
         data_export_format0 = "xlsx"
+        data_export_tables0 = ",".join(DEFAULT_EXPORT_TABLES)
         data_export_columns0 = ",".join(DEFAULT_EXPORT_COLUMNS)
         compare_t_start0 = 0.0
         compare_t_end0 = -1.0
@@ -1063,6 +1108,7 @@ class App(tk.Tk):
             ("target_tlife_s", "磨合比例 + tlife 控制的目标 tlife（s）", f"{target_tlife_s0:.6f}"),
             ("invalid_ratio_pct", "invalid 比例（%，quality flag=0）", f"{invalid_ratio_pct0:.6f}"),
             ("data_export_format", "数据导出格式：xlsx 或 db(SQLite)", str(data_export_format0)),
+            ("data_export_tables", "数据导出表（逗号分隔）", str(data_export_tables0)),
             ("data_export_columns", "数据导出列（逗号分隔）", str(data_export_columns0)),
         ]
 
@@ -1338,8 +1384,13 @@ class App(tk.Tk):
             return
 
         selected_columns = None
+        selected_tables = None
         task_label = task
         if task == "data":
+            selected_tables = self._get_selected_export_tables()
+            if not selected_tables:
+                messagebox.showerror("输入错误", "请至少勾选一张导出表。")
+                return
             selected_columns = self._get_selected_export_columns()
             if not selected_columns:
                 messagebox.showerror("输入错误", "请至少勾选一列导出数据。")
@@ -1369,6 +1420,7 @@ class App(tk.Tk):
                         out_dir=out_dir,
                         export_format=fmt,
                         selected_columns=selected_columns,
+                        selected_tables=selected_tables,
                         progress_cb=progress_cb,
                     )
                 elif task == "plots":

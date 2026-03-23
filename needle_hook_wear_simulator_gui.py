@@ -111,6 +111,16 @@ EXPORT_COLUMN_NOTES: Dict[str, str] = {
     "t_avg_closed_N": "t_avg_closed_N（闭环平均张力 N）",
 }
 
+EXPORT_TABLE_SPECS: List[Tuple[str, str]] = [
+    ("Data", "Data（主数据表）"),
+    ("open_loop", "open_loop（开环数据）"),
+    ("compare_window", "compare_window（对比窗口）"),
+]
+
+EXPORT_TABLE_LABELS: Dict[str, str] = dict(EXPORT_TABLE_SPECS)
+
+DEFAULT_EXPORT_TABLES: Tuple[str, ...] = ("Data",)
+
 
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
@@ -848,7 +858,16 @@ def _pick_mu_anchors(cfg: SimConfig, rng: np.random.Generator):
     return mu_r0, mu_st, mu_se
 
 
-def _mu_profile(t: np.ndarray, cfg: SimConfig, mu_runin_start: float, mu_stable: float, mu_severe_end: float) -> np.ndarray:
+def _mu_profile(
+    t: np.ndarray,
+    cfg: SimConfig,
+    mu_runin_start: float,
+    mu_stable: float,
+    mu_severe_end: float,
+    phase_runin_ratio: Optional[float] = None,
+    phase_stable_ratio: Optional[float] = None,
+    phase_severe_ratio: Optional[float] = None,
+) -> np.ndarray:
     """
     μ(t) 真值：磨合 → 稳定 → 加速磨损（连续）
     说明（重要）：
@@ -861,9 +880,9 @@ def _mu_profile(t: np.ndarray, cfg: SimConfig, mu_runin_start: float, mu_stable:
         return np.array([], dtype=float)
 
     # 阶段比例（已在 cfg.validate() 中归一化，这里再做一次保护）
-    r1 = max(0.0, float(cfg.phase_runin_ratio))
-    r2 = max(0.0, float(cfg.phase_stable_ratio))
-    r3 = max(0.0, float(cfg.phase_severe_ratio))
+    r1 = max(0.0, float(cfg.phase_runin_ratio if phase_runin_ratio is None else phase_runin_ratio))
+    r2 = max(0.0, float(cfg.phase_stable_ratio if phase_stable_ratio is None else phase_stable_ratio))
+    r3 = max(0.0, float(cfg.phase_severe_ratio if phase_severe_ratio is None else phase_severe_ratio))
     s = max(1e-9, r1 + r2 + r3)
     r1, r2, r3 = r1 / s, r2 / s, r3 / s
 
@@ -1117,7 +1136,15 @@ def _make_tavg_open_closed(t: np.ndarray, cfg: SimConfig, rng: np.random.Generat
     return t_open, t_closed, rpm_t, f_mech_t
 
 
-def _tensions_from_tavg_mu(t: np.ndarray, tavg: np.ndarray, mu: np.ndarray, cfg: SimConfig, rng: np.random.Generator):
+def _tensions_from_tavg_mu(
+    t: np.ndarray,
+    tavg: np.ndarray,
+    mu: np.ndarray,
+    cfg: SimConfig,
+    rng: Optional[np.random.Generator] = None,
+    sensor_noise_high: Optional[np.ndarray] = None,
+    sensor_noise_low: Optional[np.ndarray] = None,
+):
     """
     由 T_avg 与 μ 生成紧边/松边张力：
     r = exp(μθ)，且 (T_high+T_low)/2 = T_avg
@@ -1128,10 +1155,15 @@ def _tensions_from_tavg_mu(t: np.ndarray, tavg: np.ndarray, mu: np.ndarray, cfg:
     t_high = 2.0 * tavg * r / (1.0 + r)
     t_low = 2.0 * tavg / (1.0 + r)
 
-    sensor_rms_t = _slow_bounded_series(t, cfg.sensor_rms_min, cfg.sensor_rms_max, getattr(cfg, "tau_sensor_s", 0.0), rng)
+    if sensor_noise_high is None or sensor_noise_low is None:
+        if rng is None:
+            raise ValueError("需要提供 rng 或预生成的传感器噪声。")
+        sensor_rms_t = _slow_bounded_series(t, cfg.sensor_rms_min, cfg.sensor_rms_max, getattr(cfg, "tau_sensor_s", 0.0), rng)
+        sensor_noise_high = rng.normal(0.0, 1.0, size=len(t_high)) * sensor_rms_t
+        sensor_noise_low = rng.normal(0.0, 1.0, size=len(t_low)) * sensor_rms_t
 
-    t_high = np.maximum(t_high + rng.normal(0.0, 1.0, size=len(t_high)) * sensor_rms_t, 0.0)
-    t_low = np.maximum(t_low + rng.normal(0.0, 1.0, size=len(t_low)) * sensor_rms_t, 0.0)
+    t_high = np.maximum(t_high + np.asarray(sensor_noise_high, dtype=float), 0.0)
+    t_low = np.maximum(t_low + np.asarray(sensor_noise_low, dtype=float), 0.0)
     return t_high, t_low
 
 
@@ -1212,6 +1244,63 @@ def _interpolate_invalid_values(x: np.ndarray, quality_flag: np.ndarray) -> np.n
         elif right < n:
             arr[idx] = arr[right]
     return arr
+
+
+def _make_sensor_noise_pair(
+    t: np.ndarray,
+    cfg: SimConfig,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    sensor_rms_t = _slow_bounded_series(
+        t,
+        cfg.sensor_rms_min,
+        cfg.sensor_rms_max,
+        getattr(cfg, "tau_sensor_s", 0.0),
+        rng,
+    )
+    noise_high = rng.normal(0.0, 1.0, size=len(t)) * sensor_rms_t
+    noise_low = rng.normal(0.0, 1.0, size=len(t)) * sensor_rms_t
+    return noise_high.astype(float), noise_low.astype(float)
+
+
+def _estimate_target_severe_start_time(
+    cfg: SimConfig,
+    total_time_s: float,
+    t_runin_s: float,
+    target_tlife_s: float,
+    mu_stable: float,
+    mu_severe_end: float,
+    mu_ss_est: Optional[float] = None,
+) -> float:
+    dt = 1.0 / max(1e-9, float(cfg.fs_Hz))
+    if total_time_s <= 0.0:
+        return 0.0
+
+    target_tlife_s = float(max(t_runin_s + dt, min(total_time_s - dt, target_tlife_s)))
+    mu_st0 = float(np.clip(mu_stable, cfg.mu_stable_min, cfg.mu_stable_max))
+    mu_st1 = float(np.clip(mu_st0 + 0.02, cfg.mu_stable_min, cfg.mu_stable_max))
+    mu_se = float(np.clip(mu_severe_end, cfg.mu_severe_min, cfg.mu_severe_max))
+    if mu_se <= mu_st1 + 1e-9:
+        return float(max(t_runin_s + dt, min(target_tlife_s - dt, 0.5 * (t_runin_s + target_tlife_s))))
+
+    if mu_ss_est is None or (not np.isfinite(mu_ss_est)):
+        mu_ss_est = 0.5 * (mu_st0 + mu_st1)
+    mu_th_est = float(mu_ss_est) * (1.0 + float(cfg.fail_delta))
+
+    y = (mu_th_est - mu_st1) / max(1e-12, (mu_se - mu_st1))
+    y = float(max(1e-6, min(1.0 - 1e-6, y)))
+
+    k_sa = float(max(0.05, getattr(cfg, "trans_stable2severe_k", 1.0)))
+    k = 10.0 * k_sa
+    s0 = 1.0 / (1.0 + math.exp(-k * (0.0 - 0.5)))
+    s1 = 1.0 / (1.0 + math.exp(-k * (1.0 - 0.5)))
+    sig = s0 + y * max(1e-12, (s1 - s0))
+    sig = float(max(1e-6, min(1.0 - 1e-6, sig)))
+    x_cross = 0.5 + math.log(sig / (1.0 - sig)) / max(1e-9, k)
+    x_cross = float(max(1e-4, min(0.9999, x_cross)))
+
+    t_severe = (target_tlife_s - x_cross * total_time_s) / max(1e-9, (1.0 - x_cross))
+    return float(max(t_runin_s + dt, min(target_tlife_s - dt, t_severe)))
 
 
 def _find_stable_baseline(mu_f: np.ndarray, t: np.ndarray, q_valid: np.ndarray, cfg: SimConfig, end_idx: int = None):
@@ -1355,59 +1444,225 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     n = max(n, 2)
     t = np.arange(n, dtype=float) / float(cfg.fs_Hz)
 
-    _cb(progress_cb, 12.0, "生成 μ(t) 真值...")
+    _cb(progress_cb, 12.0, "生成 μ(t) 真值参数...")
     mu_runin_start_used, mu_stable_used, mu_severe_end_used = _pick_mu_anchors(cfg, rng)
-    mu_true = _mu_profile(t, cfg, mu_runin_start_used, mu_stable_used, mu_severe_end_used)
+    mode = str(getattr(cfg, "phase_control_mode", "ratio")).strip().lower()
 
     _cb(progress_cb, 18.0, "生成开环/闭环平均张力...")
     tavg_open, tavg_closed, rpm_t, f_mech_t = _make_tavg_open_closed(t, cfg, rng)
 
-    _cb(progress_cb, 24.0, "生成高/低张力侧张力（含传感器噪声）...")
-    th_open, tl_open = _tensions_from_tavg_mu(t, tavg_open, mu_true, cfg, rng)
-    th_cl, tl_cl = _tensions_from_tavg_mu(t, tavg_closed, mu_true, cfg, rng)
-
-    ff_open = th_open - tl_open
-    ff_cl = th_cl - tl_cl
-
-    _cb(progress_cb, 30.0, "Capstan 反演 μ_raw...")
-    mu_open_raw, q_open = _invert_mu_from_tensions(th_open, tl_open, cfg)
-    mu_cl_raw, q_cl = _invert_mu_from_tensions(th_cl, tl_cl, cfg)
+    _cb(progress_cb, 24.0, "预生成传感器噪声与质量标志...")
+    sensor_noise_open_high, sensor_noise_open_low = _make_sensor_noise_pair(t, cfg, rng)
+    sensor_noise_closed_high, sensor_noise_closed_low = _make_sensor_noise_pair(t, cfg, rng)
     quality_flag = _make_quality_flag(len(t), cfg.invalid_ratio, rng)
-    q_open_eff = (q_open.astype(int) * quality_flag.astype(int)).astype(int)
-    q_cl_eff = (q_cl.astype(int) * quality_flag.astype(int)).astype(int)
-
-    _cb(progress_cb, 36.0, "μ 异常点剔除（Hampel）...")
-    hampel_win = int(round(cfg.hampel_win_s * cfg.fs_Hz))
-    hampel_win = max(1, hampel_win)
-    mu_cl_h = _hampel_filter_nan(mu_cl_raw, hampel_win, cfg.hampel_nsig)
-
-    fill = np.nanmedian(mu_cl_h[np.isfinite(mu_cl_h)]) if np.any(np.isfinite(mu_cl_h)) else 0.0
-    mu_f0 = np.nan_to_num(mu_cl_h, nan=fill)
 
     rpm_used = float(np.nanmean(rpm_t)) if len(rpm_t) > 0 else cfg.rpm_used()
     f_mech_used = (rpm_used / 60.0) * float(max(1, cfg.mech_harmonic))
     q_notch = _notch_q_from_rpm(rpm_used)
-    q_notch_t = _notch_q_from_rpm_vec(rpm_t) if len(rpm_t) > 0 else np.full_like(mu_f0, q_notch, dtype=float)
-
+    q_notch_t_base = _notch_q_from_rpm_vec(rpm_t) if len(rpm_t) > 0 else np.full_like(t, q_notch, dtype=float)
     rpm_span = float(np.nanmax(rpm_t) - np.nanmin(rpm_t)) if len(rpm_t) > 0 else 0.0
     use_tv_notch = (rpm_span > 1e-6) and (float(getattr(cfg, "tau_rpm_s", 0.0)) > 0.0)
+    dt = 1.0 / max(1e-9, float(cfg.fs_Hz))
 
-    if use_tv_notch:
-        f_min = float(np.nanmin(f_mech_t))
-        f_max = float(np.nanmax(f_mech_t))
-        q_min = float(np.nanmin(q_notch_t))
-        q_max = float(np.nanmax(q_notch_t))
-        _cb(progress_cb, 40.0, f"μ 陷波（f_mech∈[{f_min:.6g},{f_max:.6g}]Hz, Q∈[{q_min:.3g},{q_max:.3g}]）...")
-        block_s = min(30.0, max(2.0, float(getattr(cfg, "tau_rpm_s", 0.0)) / 10.0))
-        mu_cl_notch = _iir_notch(mu_f0, fs=cfg.fs_Hz, f0=f_mech_t, q=q_notch_t, block_s=block_s)
+    def _run_candidate(
+        phase_stable_ratio: float,
+        phase_severe_ratio: float,
+        emit_progress: bool = False,
+    ) -> Dict[str, Any]:
+        mu_true_local = _mu_profile(
+            t,
+            cfg,
+            mu_runin_start_used,
+            mu_stable_used,
+            mu_severe_end_used,
+            phase_runin_ratio=cfg.phase_runin_ratio,
+            phase_stable_ratio=phase_stable_ratio,
+            phase_severe_ratio=phase_severe_ratio,
+        )
+
+        if emit_progress:
+            _cb(progress_cb, 24.0, "生成高/低张力侧张力（含传感器噪声）...")
+        th_open_local, tl_open_local = _tensions_from_tavg_mu(
+            t, tavg_open, mu_true_local, cfg,
+            sensor_noise_high=sensor_noise_open_high,
+            sensor_noise_low=sensor_noise_open_low,
+        )
+        th_cl_local, tl_cl_local = _tensions_from_tavg_mu(
+            t, tavg_closed, mu_true_local, cfg,
+            sensor_noise_high=sensor_noise_closed_high,
+            sensor_noise_low=sensor_noise_closed_low,
+        )
+
+        ff_open_local = th_open_local - tl_open_local
+        ff_cl_local = th_cl_local - tl_cl_local
+
+        if emit_progress:
+            _cb(progress_cb, 30.0, "Capstan 反演 μ_raw...")
+        mu_open_raw_local, q_open_local = _invert_mu_from_tensions(th_open_local, tl_open_local, cfg)
+        mu_cl_raw_local, q_cl_local = _invert_mu_from_tensions(th_cl_local, tl_cl_local, cfg)
+        q_open_eff_local = (q_open_local.astype(int) * quality_flag.astype(int)).astype(int)
+        q_cl_eff_local = (q_cl_local.astype(int) * quality_flag.astype(int)).astype(int)
+
+        if emit_progress:
+            _cb(progress_cb, 36.0, "μ 异常点剔除（Hampel）...")
+        hampel_win = int(round(cfg.hampel_win_s * cfg.fs_Hz))
+        hampel_win = max(1, hampel_win)
+        mu_cl_h_local = _hampel_filter_nan(mu_cl_raw_local, hampel_win, cfg.hampel_nsig)
+
+        fill = np.nanmedian(mu_cl_h_local[np.isfinite(mu_cl_h_local)]) if np.any(np.isfinite(mu_cl_h_local)) else 0.0
+        mu_f0_local = np.nan_to_num(mu_cl_h_local, nan=fill)
+
+        if emit_progress:
+            if use_tv_notch:
+                f_min = float(np.nanmin(f_mech_t))
+                f_max = float(np.nanmax(f_mech_t))
+                q_min = float(np.nanmin(q_notch_t_base))
+                q_max = float(np.nanmax(q_notch_t_base))
+                _cb(progress_cb, 40.0, f"μ 陷波（f_mech∈[{f_min:.6g},{f_max:.6g}]Hz, Q∈[{q_min:.3g},{q_max:.3g}]）...")
+            else:
+                _cb(progress_cb, 40.0, f"μ 陷波（f_mech={f_mech_used:.6g}Hz, Q={q_notch:.3g}）...")
+
+        if use_tv_notch:
+            block_s = min(30.0, max(2.0, float(getattr(cfg, "tau_rpm_s", 0.0)) / 10.0))
+            mu_cl_notch_local = _iir_notch(mu_f0_local, fs=cfg.fs_Hz, f0=f_mech_t, q=q_notch_t_base, block_s=block_s)
+        else:
+            mu_cl_notch_local = _iir_notch(mu_f0_local, fs=cfg.fs_Hz, f0=f_mech_used, q=q_notch)
+
+        if emit_progress:
+            _cb(progress_cb, 44.0, "μ 低通滤波...")
+        mu_cl_lp_local = _lowpass(mu_cl_notch_local, fs=cfg.fs_Hz, fc=cfg.lowpass_fc_hz, order=3).astype(float)
+        mu_cl_lp_local[q_cl_local == 0] = np.nan
+        mu_cl_lp_eval_local = mu_cl_lp_local.copy()
+
+        if emit_progress:
+            _cb(progress_cb, 48.0, "稳定段基线与寿命判据计算...")
+        stable_segs_all_local = _find_stable_segments(mu_cl_lp_eval_local, t, q_cl_eff_local, cfg, end_idx=None)
+        stable_idx0_local, mu_ss0_local = _find_stable_baseline(mu_cl_lp_eval_local, t, q_cl_eff_local, cfg, end_idx=None)
+        start_fail_idx0_local = int(stable_idx0_local[1]) if (stable_idx0_local is not None) else 0
+        tlife0_local, mu_th0_local = _find_failure_time(mu_cl_lp_eval_local, t, q_cl_eff_local, mu_ss0_local, cfg, start_idx=start_fail_idx0_local)
+
+        tlife_local = tlife0_local
+        mu_th_local = mu_th0_local
+        tlife_idx_local = None
+        if tlife0_local is not None:
+            tlife_idx_local = int(max(1, min(len(t), int(round(float(tlife0_local) * cfg.fs_Hz)) + 1)))
+            stable_idx_local, mu_ss_local = _find_stable_baseline(mu_cl_lp_eval_local, t, q_cl_eff_local, cfg, end_idx=tlife_idx_local)
+            if mu_ss_local is None or not np.isfinite(mu_ss_local):
+                stable_idx_local, mu_ss_local = stable_idx0_local, mu_ss0_local
+        else:
+            stable_idx_local, mu_ss_local = stable_idx0_local, mu_ss0_local
+
+        if mu_ss_local is not None and np.isfinite(mu_ss_local):
+            start_fail_idx_local = int(stable_idx_local[1]) if (stable_idx_local is not None) else 0
+            tlife_local, mu_th_local = _find_failure_time(mu_cl_lp_eval_local, t, q_cl_eff_local, mu_ss_local, cfg, start_idx=start_fail_idx_local)
+            if tlife_local is not None:
+                tlife_idx_local = int(max(1, min(len(t), int(round(float(tlife_local) * cfg.fs_Hz)) + 1)))
+
+        return {
+            "phase_stable_ratio_used": float(phase_stable_ratio),
+            "phase_severe_ratio_used": float(phase_severe_ratio),
+            "mu_true": mu_true_local,
+            "th_open": th_open_local,
+            "tl_open": tl_open_local,
+            "th_cl": th_cl_local,
+            "tl_cl": tl_cl_local,
+            "ff_open": ff_open_local,
+            "ff_cl": ff_cl_local,
+            "mu_open_raw": mu_open_raw_local,
+            "mu_cl_raw": mu_cl_raw_local,
+            "mu_cl_h": mu_cl_h_local,
+            "mu_cl_notch": mu_cl_notch_local,
+            "mu_cl_lp": mu_cl_lp_local,
+            "mu_cl_lp_eval": mu_cl_lp_eval_local,
+            "q_open_eff": q_open_eff_local,
+            "q_cl_eff": q_cl_eff_local,
+            "stable_segs_all": stable_segs_all_local,
+            "stable_idx": stable_idx_local,
+            "mu_ss": mu_ss_local,
+            "mu_th": mu_th_local,
+            "tlife_scan": tlife_local,
+            "tlife_idx_scan": tlife_idx_local,
+        }
+
+    if mode == "runin_tlife":
+        total_time_s = float(t[-1]) if len(t) else 0.0
+        target_tlife_s = float(max(0.0, min(total_time_s, float(getattr(cfg, "target_tlife_s", total_time_s)))))
+        t_runin_s = float(cfg.phase_runin_ratio) * total_time_s
+        guess_t_severe = _estimate_target_severe_start_time(
+            cfg,
+            total_time_s=total_time_s,
+            t_runin_s=t_runin_s,
+            target_tlife_s=target_tlife_s,
+            mu_stable=mu_stable_used,
+            mu_severe_end=mu_severe_end_used,
+        )
+        prev_guess_t = None
+        prev_tlife_scan = None
+        final_stable_ratio = float(cfg.phase_stable_ratio)
+        final_severe_ratio = float(cfg.phase_severe_ratio)
+        for _ in range(3):
+            severe_start_ratio = float(max(cfg.phase_runin_ratio + 1e-6, min(0.999999, guess_t_severe / max(1e-9, total_time_s))))
+            stable_ratio_try = max(0.0, severe_start_ratio - float(cfg.phase_runin_ratio))
+            severe_ratio_try = max(0.0, 1.0 - float(cfg.phase_runin_ratio) - stable_ratio_try)
+            cand_try = _run_candidate(stable_ratio_try, severe_ratio_try, emit_progress=False)
+            final_stable_ratio = stable_ratio_try
+            final_severe_ratio = severe_ratio_try
+
+            tlife_scan = cand_try["tlife_scan"]
+            if tlife_scan is not None and abs(float(tlife_scan) - target_tlife_s) <= dt:
+                break
+
+            if tlife_scan is None:
+                next_guess_t = guess_t_severe - max(dt, 0.20 * max(dt, target_tlife_s - t_runin_s))
+            elif prev_guess_t is not None and prev_tlife_scan is not None and abs(float(tlife_scan) - float(prev_tlife_scan)) > 1e-9:
+                next_guess_t = guess_t_severe + (target_tlife_s - float(tlife_scan)) * (guess_t_severe - prev_guess_t) / (float(tlife_scan) - float(prev_tlife_scan))
+            else:
+                next_guess_t = guess_t_severe - (float(tlife_scan) - target_tlife_s)
+
+            prev_guess_t = guess_t_severe
+            prev_tlife_scan = tlife_scan
+            guess_t_severe = float(max(t_runin_s + dt, min(target_tlife_s - dt, next_guess_t)))
+
+        cfg.phase_stable_ratio = float(final_stable_ratio)
+        cfg.phase_severe_ratio = float(final_severe_ratio)
+        cfg.severe_start_ratio = float(cfg.phase_runin_ratio + cfg.phase_stable_ratio)
+        candidate = _run_candidate(cfg.phase_stable_ratio, cfg.phase_severe_ratio, emit_progress=True)
     else:
-        _cb(progress_cb, 40.0, f"μ 陷波（f_mech={f_mech_used:.6g}Hz, Q={q_notch:.3g}）...")
-        mu_cl_notch = _iir_notch(mu_f0, fs=cfg.fs_Hz, f0=f_mech_used, q=q_notch)
+        candidate = _run_candidate(cfg.phase_stable_ratio, cfg.phase_severe_ratio, emit_progress=True)
 
-    _cb(progress_cb, 44.0, "μ 低通滤波...")
-    mu_cl_lp = _lowpass(mu_cl_notch, fs=cfg.fs_Hz, fc=cfg.lowpass_fc_hz, order=3).astype(float)
-    mu_cl_lp[q_cl == 0] = np.nan
-    mu_cl_lp_eval = mu_cl_lp.copy()
+    mu_true = candidate["mu_true"]
+    th_open = candidate["th_open"]
+    tl_open = candidate["tl_open"]
+    th_cl = candidate["th_cl"]
+    tl_cl = candidate["tl_cl"]
+    ff_open = candidate["ff_open"]
+    ff_cl = candidate["ff_cl"]
+    mu_open_raw = candidate["mu_open_raw"]
+    mu_cl_raw = candidate["mu_cl_raw"]
+    mu_cl_h = candidate["mu_cl_h"]
+    mu_cl_notch = candidate["mu_cl_notch"]
+    mu_cl_lp = candidate["mu_cl_lp"]
+    mu_cl_lp_eval = candidate["mu_cl_lp_eval"]
+    q_open_eff = candidate["q_open_eff"]
+    q_cl_eff = candidate["q_cl_eff"]
+    stable_segs = candidate["stable_segs_all"]
+
+    if mode == "runin_tlife":
+        tlife = float(max(0.0, min(float(t[-1]) if len(t) else 0.0, float(getattr(cfg, "target_tlife_s", 0.0)))))
+        tlife_idx = int(np.searchsorted(t, tlife, side="right")) if len(t) > 0 else None
+        if tlife_idx is not None:
+            tlife_idx = int(max(1, min(len(t), tlife_idx)))
+        stable_idx, mu_ss = _find_stable_baseline(mu_cl_lp_eval, t, q_cl_eff, cfg, end_idx=tlife_idx)
+        if mu_ss is None or not np.isfinite(mu_ss):
+            stable_idx = candidate["stable_idx"]
+            mu_ss = candidate["mu_ss"]
+        mu_th = float(mu_ss * (1.0 + cfg.fail_delta)) if (mu_ss is not None and np.isfinite(mu_ss)) else candidate["mu_th"]
+    else:
+        stable_idx = candidate["stable_idx"]
+        mu_ss = candidate["mu_ss"]
+        mu_th = candidate["mu_th"]
+        tlife = candidate["tlife_scan"]
+        tlife_idx = candidate["tlife_idx_scan"]
 
     mu_true_disp = _interpolate_invalid_values(mu_true, quality_flag)
     tavg_open_disp = _interpolate_invalid_values(tavg_open, quality_flag)
@@ -1425,39 +1680,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     mu_cl_lp_disp = _interpolate_invalid_values(mu_cl_lp, quality_flag)
     rpm_t_disp = _interpolate_invalid_values(rpm_t, quality_flag)
     f_mech_t_disp = _interpolate_invalid_values(f_mech_t, quality_flag)
-    q_notch_t_disp = _interpolate_invalid_values(q_notch_t, quality_flag)
-
-    _cb(progress_cb, 48.0, "稳定段基线与寿命判据计算...")
-    # 1) 先识别“全时域”的连续稳定段（用于可视化）；绘图时再裁剪 tlife 右侧
-    stable_segs_all = _find_stable_segments(mu_cl_lp_eval, t, q_cl_eff, cfg, end_idx=None)
-
-    # 2) 先在全时域寻找稳定段基线 μss（得到稳定窗口 stable_idx0）
-    stable_idx0, mu_ss0 = _find_stable_baseline(mu_cl_lp_eval, t, q_cl_eff, cfg, end_idx=None)
-
-    # 3) 初步计算 tlife（从稳定窗口结束开始判定，避免磨合段 μ 偏高导致 tlife=0s）
-    start_fail_idx0 = int(stable_idx0[1]) if (stable_idx0 is not None) else 0
-    tlife0, mu_th0 = _find_failure_time(mu_cl_lp_eval, t, q_cl_eff, mu_ss0, cfg, start_idx=start_fail_idx0)
-
-    # 4) 若存在 tlife0，则优先在 tlife0 之前重算 μss（更符合“失效前基线”意义）；否则沿用全时域
-    tlife = tlife0
-    mu_th = mu_th0
-    tlife_idx = None
-    if tlife0 is not None:
-        tlife_idx = int(max(1, min(len(t), int(round(float(tlife0) * cfg.fs_Hz)) + 1)))
-        stable_idx, mu_ss = _find_stable_baseline(mu_cl_lp_eval, t, q_cl_eff, cfg, end_idx=tlife_idx)
-        if mu_ss is None or not np.isfinite(mu_ss):
-            stable_idx, mu_ss = stable_idx0, mu_ss0
-    else:
-        stable_idx, mu_ss = stable_idx0, mu_ss0
-
-    # 5) 用最终 μss 重新计算 tlife 与 μth（同样从稳定窗口结束开始）
-    if mu_ss is not None and np.isfinite(mu_ss):
-        start_fail_idx = int(stable_idx[1]) if (stable_idx is not None) else 0
-        tlife, mu_th = _find_failure_time(mu_cl_lp_eval, t, q_cl_eff, mu_ss, cfg, start_idx=start_fail_idx)
-        if tlife is not None:
-            tlife_idx = int(max(1, min(len(t), int(round(float(tlife) * cfg.fs_Hz)) + 1)))
-
-    stable_segs = stable_segs_all
+    q_notch_t_disp = _interpolate_invalid_values(q_notch_t_base, quality_flag)
 
     res = {
         "cfg": cfg,
@@ -1661,9 +1884,28 @@ def _normalize_export_columns(selected_columns: Optional[List[str]] = None) -> L
     return normalized
 
 
+def _normalize_export_tables(selected_tables: Optional[List[str]] = None) -> List[str]:
+    if selected_tables is None:
+        return list(DEFAULT_EXPORT_TABLES)
+
+    normalized: List[str] = []
+    seen = set()
+    for name in selected_tables:
+        key = str(name).strip()
+        if (not key) or (key in seen) or (key not in EXPORT_TABLE_LABELS):
+            continue
+        seen.add(key)
+        normalized.append(key)
+
+    if not normalized:
+        raise ValueError("至少需要选择一张导出表。")
+    return normalized
+
+
 def _build_data_export_tables(
     res: Dict[str, Any],
     selected_columns: Optional[List[str]] = None,
+    selected_tables: Optional[List[str]] = None,
 ) -> Dict[str, pd.DataFrame]:
     cfg: SimConfig = res["cfg"]
     t = res["series"]["t"]
@@ -1696,6 +1938,7 @@ def _build_data_export_tables(
     cl = res["series"]["closed"]
     op = res["series"]["open"]
     selected = _normalize_export_columns(selected_columns)
+    selected_table_names = _normalize_export_tables(selected_tables)
 
     closed_df = pd.DataFrame({
         "t_s": t_e,
@@ -1771,10 +2014,15 @@ def _build_data_export_tables(
         "t_avg_closed_N": ds(cl["tavg"])[cmp_mask],
     })
 
-    return {
-        "closed_loop": closed_df,
+    tables_all = {
+        "Data": closed_df,
         "open_loop": open_df,
         "compare_window": compare_df,
+    }
+    return {
+        name: tables_all[name]
+        for name in selected_table_names
+        if name in tables_all
     }
 
 
@@ -1818,6 +2066,7 @@ def export_data(
     out_dir: str,
     export_format: str = "xlsx",
     selected_columns: Optional[List[str]] = None,
+    selected_tables: Optional[List[str]] = None,
     progress_cb: ProgressCB = None,
 ) -> str:
     """导出仿真数据，支持 xlsx 与 SQLite 数据库。"""
@@ -1831,7 +2080,11 @@ def export_data(
         raise ValueError(f"不支持的导出格式：{export_format}")
 
     _cb(progress_cb, 52.0, "组织导出数据表...")
-    tables = _build_data_export_tables(res, selected_columns=selected_columns)
+    tables = _build_data_export_tables(
+        res,
+        selected_columns=selected_columns,
+        selected_tables=selected_tables,
+    )
 
     if fmt == "xlsx":
         xlsx_path = os.path.join(out_dir, "needle_hook_wear_sim.xlsx")
@@ -1864,6 +2117,7 @@ def export_xlsx(
     out_dir: str,
     progress_cb: ProgressCB = None,
     selected_columns: Optional[List[str]] = None,
+    selected_tables: Optional[List[str]] = None,
 ) -> str:
     """导出 xlsx（多 sheet 自动拆分）。"""
     return export_data(
@@ -1871,6 +2125,7 @@ def export_xlsx(
         out_dir=out_dir,
         export_format="xlsx",
         selected_columns=selected_columns,
+        selected_tables=selected_tables,
         progress_cb=progress_cb,
     )
 
@@ -2036,7 +2291,8 @@ def export_plots(
 
     # tlife：只在图例显示数值（不在图中显示文字）
     if tlife is not None:
-        label = f'{L["tlife"]}≈{float(tlife):.1f}s'
+        tlife_mark = "=" if str(res.get("derived", {}).get("phase_control_mode_used", "")).strip().lower() == "runin_tlife" else "≈"
+        label = f'{L["tlife"]}{tlife_mark}{float(tlife):.1f}s'
         plt.axvline(float(tlife), linestyle="--", label=label, color="tab:purple")
 
     plt.xlabel(L["t"])
