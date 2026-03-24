@@ -1548,7 +1548,9 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
             _cb(progress_cb, 44.0, "μ 低通滤波...")
         mu_cl_lp_local = _lowpass(mu_cl_notch_local, fs=cfg.fs_Hz, fc=cfg.lowpass_fc_hz, order=3).astype(float)
         mu_cl_lp_local[q_cl_local == 0] = np.nan
-        mu_cl_lp_eval_local = mu_cl_lp_local.copy()
+        # 判据与显示统一使用同一条 μ 曲线，避免“图上 μ”与“tlife 判据 μ”不一致。
+        mu_cl_lp_disp_local = _interpolate_invalid_values(mu_cl_lp_local, q_cl_eff_local)
+        mu_cl_lp_eval_local = mu_cl_lp_disp_local.copy()
 
         if emit_progress:
             _cb(progress_cb, 48.0, "稳定段基线与寿命判据计算...")
@@ -1590,6 +1592,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
             "mu_cl_h": mu_cl_h_local,
             "mu_cl_notch": mu_cl_notch_local,
             "mu_cl_lp": mu_cl_lp_local,
+            "mu_cl_lp_disp": mu_cl_lp_disp_local,
             "mu_cl_lp_eval": mu_cl_lp_eval_local,
             "q_open_eff": q_open_eff_local,
             "q_cl_eff": q_cl_eff_local,
@@ -1633,6 +1636,7 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     mu_cl_h = candidate["mu_cl_h"]
     mu_cl_notch = candidate["mu_cl_notch"]
     mu_cl_lp = candidate["mu_cl_lp"]
+    mu_cl_lp_disp = candidate["mu_cl_lp_disp"]
     mu_cl_lp_eval = candidate["mu_cl_lp_eval"]
     q_open_eff = candidate["q_open_eff"]
     q_cl_eff = candidate["q_cl_eff"]
@@ -1668,7 +1672,8 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     mu_cl_raw_disp = _interpolate_invalid_values(mu_cl_raw, quality_flag)
     mu_cl_h_disp = _interpolate_invalid_values(mu_cl_h, quality_flag)
     mu_cl_notch_disp = _interpolate_invalid_values(mu_cl_notch, quality_flag)
-    mu_cl_lp_disp = _interpolate_invalid_values(mu_cl_lp, quality_flag)
+    # 直接复用判据所用的显示态 μ，确保图上曲线与 μss/μth/tlife/稳定段一致。
+    mu_cl_lp_disp = np.asarray(mu_cl_lp_disp, dtype=float)
     rpm_t_disp = _interpolate_invalid_values(rpm_t, quality_flag)
     f_mech_t_disp = _interpolate_invalid_values(f_mech_t, quality_flag)
     q_notch_t_disp = _interpolate_invalid_values(q_notch_t_base, quality_flag)
