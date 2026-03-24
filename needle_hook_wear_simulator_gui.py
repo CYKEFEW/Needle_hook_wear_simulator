@@ -1963,7 +1963,7 @@ def _build_data_export_tables(
         "t_low_N": ds(op["tl"]),
         "t_avg_N": ds(op["tavg"]),
         "f_fric_N": ds(op["ff"]),
-                "mu": ds(op["mu_filt"]),
+                "mu": fill_nan(),
         "quality_flag": ds(quality_flag).astype(int),
         "mu_runin_start_used": fill_const(res["derived"].get("mu_runin_start_used", np.nan)),
         "mu_stable_used": fill_const(res["derived"].get("mu_stable_used", np.nan)),
