@@ -856,7 +856,7 @@ class App(tk.Tk):
         self._ini_template_path = self._resource_dir / "defaultData.ini"
 
     def _fallback_ini_path(self) -> Path:
-        base = Path.home() / "needle_hook_wear_sim"
+        base = Path.home() / "needle_hook_wear"
         base.mkdir(parents=True, exist_ok=True)
         return base / "defaultData.ini"
 
