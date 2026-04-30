@@ -1849,7 +1849,7 @@ def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = Non
     open_df.rename(columns=col_note, inplace=True)
     compare_df.rename(columns=col_note, inplace=True)
 
-    xlsx_path = os.path.join(out_dir, "needle_hook_wear_sim.xlsx")
+    xlsx_path = os.path.join(out_dir, "needle_hook_wear.xlsx")
     _cb(progress_cb, 55.0, "开始写入 xlsx（多sheet，必要时自动拆分）...")
     _write_xlsx_multisheet(
         xlsx_path,
@@ -2083,7 +2083,7 @@ def export_data(
     )
 
     if fmt == "xlsx":
-        xlsx_path = os.path.join(out_dir, "needle_hook_wear_sim.xlsx")
+        xlsx_path = os.path.join(out_dir, "needle_hook_wear.xlsx")
         _cb(progress_cb, 55.0, "开始写入 xlsx（多 sheet，必要时自动拆分）...")
         _write_xlsx_multisheet(
             xlsx_path,
@@ -2095,7 +2095,7 @@ def export_data(
         _cb(progress_cb, 100.0, "xlsx 导出完成")
         return xlsx_path
 
-    db_path = os.path.join(out_dir, "needle_hook_wear_sim.db")
+    db_path = os.path.join(out_dir, "needle_hook_wear.db")
     _cb(progress_cb, 55.0, "开始写入 SQLite 数据库...")
     _write_sqlite_tables(
         db_path,
