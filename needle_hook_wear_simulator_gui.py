@@ -25,6 +25,7 @@ import os
 import json
 import math
 import sqlite3
+import copy
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, Callable, List, Tuple
 
@@ -1448,7 +1449,7 @@ def _find_failure_time(
     return None, mu_th
 
 
-def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> Dict[str, Any]:
+def _simulate_core(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> Dict[str, Any]:
     """仅生成仿真结果（不导出文件）"""
     cfg.validate()
     rng = np.random.default_rng(seed)
@@ -1652,6 +1653,12 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
             stable_idx = candidate["stable_idx"]
             mu_ss = candidate["mu_ss"]
         mu_th = float(mu_ss * (1.0 + cfg.fail_delta)) if (mu_ss is not None and np.isfinite(mu_ss)) else candidate["mu_th"]
+        if tlife_idx is not None:
+            stable_segs = [
+                (int(k0), int(min(k1, tlife_idx)))
+                for k0, k1 in (stable_segs or [])
+                if int(k0) < int(tlife_idx) and int(min(k1, tlife_idx)) > int(k0)
+            ]
     else:
         stable_idx = candidate["stable_idx"]
         mu_ss = candidate["mu_ss"]
@@ -1697,6 +1704,10 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
             "runin_ratio_by_tlife_used": float(cfg.runin_ratio_by_tlife),
             "target_tlife_s_used": float(cfg.target_tlife_s),
             "invalid_ratio_used": float(cfg.invalid_ratio),
+            "original_duration_s_used": float(cfg.duration_s),
+            "effective_duration_s_used": float(cfg.duration_s),
+            "short_tlife_extension_used": False,
+            "tail_extension_mode_used": "none",
         },
         "series": {
             "t": t,
@@ -1717,6 +1728,187 @@ def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> D
     }
     _cb(progress_cb, 50.0, "仿真结果生成完成（可导出 xlsx 或导出图片）")
     return res
+
+def _clip_segments_to_idx(stable_segs: Any, end_idx: Optional[int]) -> List[Tuple[int, int]]:
+    if stable_segs is None or end_idx is None:
+        return list(stable_segs or [])
+    end_idx = int(max(0, end_idx))
+    clipped: List[Tuple[int, int]] = []
+    for k0, k1 in stable_segs:
+        a = int(k0)
+        b = int(min(int(k1), end_idx))
+        if a < end_idx and b > a:
+            clipped.append((a, b))
+    return clipped
+
+
+def _extend_array_template(
+    arr: np.ndarray,
+    n_full: int,
+    template_start: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    src = np.asarray(arr)
+    n_work = int(len(src))
+    if n_work >= n_full:
+        return src[:n_full].copy()
+    out = np.empty(n_full, dtype=src.dtype)
+    out[:n_work] = src
+    template_start = int(max(0, min(n_work - 1, template_start))) if n_work > 0 else 0
+    template = src[template_start:n_work]
+    if template.size == 0:
+        template = src[-1:] if n_work > 0 else np.zeros(1, dtype=src.dtype)
+    need = n_full - n_work
+    if not np.issubdtype(src.dtype, np.floating):
+        pos = 0
+        block_len = int(len(template))
+        while pos < need:
+            take = min(block_len, need - pos)
+            block = np.roll(template, int(rng.integers(0, block_len))) if block_len > 1 else template
+            out[n_work + pos:n_work + pos + take] = block[:take]
+            pos += take
+        return out
+
+    template_f = np.asarray(template, dtype=float)
+    if template_f.size == 0:
+        out[n_work:] = 0.0
+        return out
+
+    tail = np.empty(need, dtype=float)
+    pos = 0
+    block_len = int(len(template_f))
+    finite = template_f[np.isfinite(template_f)]
+    center = float(np.nanmedian(finite)) if finite.size else 0.0
+    sigma = float(np.nanstd(finite)) if finite.size else 0.0
+    scale = max(sigma, abs(center) * 1e-4, 1e-6)
+
+    while pos < need:
+        take = min(block_len, need - pos)
+        block = template_f
+        if pos > 0 and block_len > 1:
+            block = np.roll(block, int(rng.integers(0, block_len)))
+        chunk = np.asarray(block[:take], dtype=float).copy()
+        chunk[~np.isfinite(chunk)] = center
+        x = np.linspace(0.0, 1.0, take, endpoint=False)
+        amp = 1.0 + float(rng.normal(0.0, 0.012))
+        drift_end = float(rng.normal(0.0, 0.08 * scale))
+        drift = np.linspace(0.0, drift_end, take, endpoint=False)
+        phase = float(rng.uniform(0.0, 2.0 * np.pi))
+        wobble = 0.03 * scale * np.sin(2.0 * np.pi * x + phase)
+        jitter = rng.normal(0.0, 0.01 * scale, size=take)
+        tail[pos:pos + take] = center + (chunk - center) * amp + drift + wobble + jitter
+        pos += take
+
+    out[n_work:] = tail.astype(src.dtype, copy=False)
+    return out
+
+
+def _extend_short_tlife_result(
+    res: Dict[str, Any],
+    original_duration_s: float,
+    seed: int,
+    progress_cb: ProgressCB = None,
+) -> Dict[str, Any]:
+    cfg: SimConfig = res["cfg"]
+    fs = float(max(1e-9, cfg.fs_Hz))
+    t_work = np.asarray(res["series"]["t"], dtype=float)
+    n_work = int(len(t_work))
+    n_full = max(2, int(round(fs * float(original_duration_s))))
+    if n_work >= n_full:
+        res["derived"]["original_duration_s_used"] = float(original_duration_s)
+        res["derived"]["effective_duration_s_used"] = float(cfg.duration_s)
+        res["derived"]["short_tlife_extension_used"] = False
+        res["derived"]["tail_extension_mode_used"] = "none"
+        return res
+
+    _cb(progress_cb, 49.0, "短 tlife 尾段补全...")
+    t_full = np.arange(n_full, dtype=float) / fs
+    tlife_s = res.get("life", {}).get("tlife_s")
+    if tlife_s is None or not np.isfinite(float(tlife_s)):
+        tlife_idx = int(res.get("baseline", {}).get("tlife_idx") or max(1, n_work - 1))
+    else:
+        tlife_idx = int(np.searchsorted(t_full, float(tlife_s), side="right"))
+    tlife_idx = int(max(1, min(n_full, tlife_idx)))
+
+    severe_start = int(max(tlife_idx, n_work - max(1, (n_work - min(tlife_idx, n_work)) // 2)))
+    severe_start = int(max(0, min(max(0, n_work - 1), severe_start)))
+
+    series = res["series"]
+    rng_ext = np.random.default_rng(np.random.SeedSequence([int(seed), int(n_work), int(n_full), 271828]))
+    tail_mode_used = "template"
+
+    for key, value in list(series.items()):
+        if key in ("t", "open", "closed"):
+            continue
+        arr = np.asarray(value)
+        if len(arr) != n_work:
+            continue
+        series[key] = _extend_array_template(arr, n_full, severe_start, rng_ext)
+
+    for group in ("open", "closed"):
+        if group not in series:
+            continue
+        for key, value in list(series[group].items()):
+            arr = np.asarray(value)
+            if len(arr) != n_work:
+                continue
+            series[group][key] = _extend_array_template(arr, n_full, severe_start, rng_ext)
+
+    series["t"] = t_full
+    res["cfg"] = copy.copy(cfg)
+    res["cfg"].duration_s = float(original_duration_s)
+
+    baseline = res.setdefault("baseline", {})
+    baseline["tlife_idx"] = tlife_idx
+    baseline["stable_segments_idx"] = _clip_segments_to_idx(baseline.get("stable_segments_idx"), tlife_idx)
+    stable_idx = baseline.get("stable_window_idx")
+    if stable_idx is not None:
+        a, b = stable_idx
+        baseline["stable_window_idx"] = (int(a), int(min(int(b), tlife_idx)))
+
+    derived = res.setdefault("derived", {})
+    derived["original_duration_s_used"] = float(original_duration_s)
+    derived["effective_duration_s_used"] = float(cfg.duration_s)
+    derived["short_tlife_extension_used"] = True
+    derived["tail_extension_mode_used"] = tail_mode_used
+    return res
+
+
+def simulate(cfg: SimConfig, seed: int = 7, progress_cb: ProgressCB = None) -> Dict[str, Any]:
+    """Generate simulation results. Short runin_tlife cases use a temporary shorter core domain."""
+    probe = copy.deepcopy(cfg)
+    probe.validate()
+    mode = str(getattr(probe, "phase_control_mode", "ratio")).strip().lower()
+    original_duration_s = float(probe.duration_s)
+    fs = float(max(1e-9, probe.fs_Hz))
+    target_tlife_s = float(getattr(probe, "target_tlife_s", original_duration_s))
+
+    short_tlife = (
+        mode == "runin_tlife"
+        and original_duration_s > 0.0
+        and target_tlife_s < 0.5 * original_duration_s
+    )
+    if not short_tlife:
+        return _simulate_core(cfg, seed=seed, progress_cb=progress_cb)
+
+    effective_duration_s = min(
+        original_duration_s,
+        max(target_tlife_s + 2.0 / fs, 1.8 * target_tlife_s),
+    )
+    if effective_duration_s >= original_duration_s - 1.0 / fs:
+        return _simulate_core(cfg, seed=seed, progress_cb=progress_cb)
+
+    work_cfg = copy.deepcopy(cfg)
+    work_cfg.duration_s = float(effective_duration_s)
+    work_cfg.target_tlife_s = float(target_tlife_s)
+    _cb(progress_cb, 3.0, f"短 tlife：临时仿真时长 {effective_duration_s:.2f}s，随后补全尾段...")
+    res = _simulate_core(work_cfg, seed=seed, progress_cb=progress_cb)
+    return _extend_short_tlife_result(
+        res,
+        original_duration_s=original_duration_s,
+        seed=seed,
+        progress_cb=progress_cb,
+    )
 
 
 def export_xlsx(res: Dict[str, Any], out_dir: str, progress_cb: ProgressCB = None) -> str:
